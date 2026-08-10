@@ -35,6 +35,15 @@ export function listConversations(clientId: string): Promise<{ conversations: Co
   return jsonFetch(`/conversations?clientId=${encodeURIComponent(clientId)}`);
 }
 
+export async function deleteConversation(conversationId: string, clientId: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/conversations/${conversationId}?clientId=${encodeURIComponent(clientId)}`, {
+    method: 'DELETE',
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`DELETE /conversations/${conversationId} failed: ${res.status}`);
+  }
+}
+
 export function getHistory(
   conversationId: string,
 ): Promise<{ conversationId: string; messages: Message[] }> {

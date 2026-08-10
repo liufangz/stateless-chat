@@ -176,6 +176,44 @@ export async function markMessageStatus(
   ]);
 }
 
+/**
+ * Deletes a conversation and all of its messages. Scoped by clientId when
+ * provided so a client can't delete a conversation it doesn't own. Returns
+ * true if a conversation was actually deleted.
+ */
+export async function deleteConversation(
+  pool: pg.Pool,
+  conversationId: string,
+  clientId?: string
+): Promise<boolean> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    const { rows } = await client.query<Conversation>(
+      `SELECT * FROM conversations
+       WHERE id = $1 AND ($2::text IS NULL OR client_id = $2)`,
+      [conversationId, clientId ?? null]
+    );
+    if (rows.length === 0) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    await client.query(`DELETE FROM messages WHERE conversation_id = $1`, [
+      conversationId,
+    ]);
+    await client.query(`DELETE FROM conversations WHERE id = $1`, [
+      conversationId,
+    ]);
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
 export async function insertAssistantMessage(
   pool: pg.Pool,
   conversationId: string,

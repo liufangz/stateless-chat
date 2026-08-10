@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { createConversation, getHistory, listConversations, sendMessage, streamReply } from './lib/api';
+import { createConversation, deleteConversation, getHistory, listConversations, sendMessage, streamReply } from './lib/api';
 import { getOrCreateClientId, getStoredConversationId, setStoredConversationId } from './lib/storage';
 import type { ConversationSummary, Message } from './types';
 import { MessageList } from './components/MessageList';
@@ -97,6 +97,45 @@ export default function App() {
     }
   }
 
+  async function handleDeleteConversation(id: string) {
+    try {
+      await deleteConversation(id, clientIdRef.current);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to delete conversation');
+      return;
+    }
+
+    const remaining = conversations.filter((c) => c.id !== id);
+    setConversations(remaining);
+
+    if (id !== conversationId) return;
+
+    if (remaining.length > 0) {
+      const next = remaining[0];
+      try {
+        const history = await getHistory(next.id);
+        setStoredConversationId(next.id);
+        setConversationId(next.id);
+        setMessages(history.messages);
+        setErrorMessage(null);
+      } catch (err) {
+        setErrorMessage(err instanceof Error ? err.message : 'Failed to load conversation');
+      }
+      return;
+    }
+
+    try {
+      const created = await createConversation(clientIdRef.current);
+      setStoredConversationId(created.conversationId);
+      setConversationId(created.conversationId);
+      setMessages([]);
+      setErrorMessage(null);
+      refreshConversations();
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to start a new chat');
+    }
+  }
+
   async function handleSend(content: string) {
     if (!conversationId || sending) return;
     setSending(true);
@@ -151,6 +190,7 @@ export default function App() {
         disabled={sending}
         onSelect={handleSelectConversation}
         onNewChat={handleNewChat}
+        onDelete={handleDeleteConversation}
       />
 
       <div className="flex flex-1 flex-col">

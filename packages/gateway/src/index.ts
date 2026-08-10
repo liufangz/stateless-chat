@@ -7,6 +7,7 @@ import {
   createConversation,
   getConversation,
   listConversations,
+  deleteConversation,
   insertUserMessage,
   getMessage,
   getReply,
@@ -117,6 +118,26 @@ async function main() {
       const clientId = typeof req.query.clientId === "string" ? req.query.clientId.trim() : "";
       const conversations = await listConversations(pool, clientId || undefined);
       res.status(200).json({ conversations });
+    })
+  );
+
+  // Delete a conversation and all of its messages. Scoped by clientId (query
+  // or body) when provided, so a client can't delete another client's
+  // conversation.
+  app.delete(
+    "/conversations/:conversationId",
+    asyncHandler(async (req: Request, res: Response) => {
+      const clientId = String(req.query.clientId ?? req.body?.clientId ?? "").trim();
+      const deleted = await deleteConversation(
+        pool,
+        req.params.conversationId,
+        clientId || undefined
+      );
+      if (!deleted) {
+        res.status(404).json({ error: "conversation not found" });
+        return;
+      }
+      res.status(204).end();
     })
   );
 
