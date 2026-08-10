@@ -1,4 +1,4 @@
-import type { Message } from '../types';
+import type { ConversationSummary, Message } from '../types';
 
 const API_BASE = '/api';
 
@@ -29,6 +29,10 @@ export function sendMessage(
     method: 'POST',
     body: JSON.stringify({ clientId, content }),
   });
+}
+
+export function listConversations(clientId: string): Promise<{ conversations: ConversationSummary[] }> {
+  return jsonFetch(`/conversations?clientId=${encodeURIComponent(clientId)}`);
 }
 
 export function getHistory(

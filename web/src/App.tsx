@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
-import { createConversation, getHistory, sendMessage, streamReply } from './lib/api';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { createConversation, getHistory, listConversations, sendMessage, streamReply } from './lib/api';
 import { getOrCreateClientId, getStoredConversationId, setStoredConversationId } from './lib/storage';
-import type { Message } from './types';
+import type { ConversationSummary, Message } from './types';
 import { MessageList } from './components/MessageList';
 import { Composer } from './components/Composer';
+import { Sidebar } from './components/Sidebar';
 
 type InitState = 'loading' | 'ready' | 'error';
 
@@ -14,6 +15,20 @@ export default function App() {
   const [initState, setInitState] = useState<InitState>('loading');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const [conversations, setConversations] = useState<ConversationSummary[]>([]);
+  const [conversationsLoading, setConversationsLoading] = useState(true);
+
+  const refreshConversations = useCallback(async () => {
+    try {
+      const { conversations: list } = await listConversations(clientIdRef.current);
+      setConversations(list);
+    } catch {
+      // Sidebar refresh is best-effort - the active conversation still works
+      // even if this fails, so swallow the error instead of surfacing it.
+    } finally {
+      setConversationsLoading(false);
+    }
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -29,6 +44,7 @@ export default function App() {
             setConversationId(convId);
             setMessages(history.messages);
             setInitState('ready');
+            refreshConversations();
             return;
           } catch {
             convId = null;
@@ -40,6 +56,7 @@ export default function App() {
         setConversationId(created.conversationId);
         setMessages([]);
         setInitState('ready');
+        refreshConversations();
       } catch (err) {
         if (cancelled) return;
         setErrorMessage(err instanceof Error ? err.message : 'Failed to reach the backend');
@@ -51,7 +68,34 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [refreshConversations]);
+
+  async function handleSelectConversation(id: string) {
+    if (id === conversationId || sending) return;
+    try {
+      const history = await getHistory(id);
+      setStoredConversationId(id);
+      setConversationId(id);
+      setMessages(history.messages);
+      setErrorMessage(null);
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to load conversation');
+    }
+  }
+
+  async function handleNewChat() {
+    if (sending) return;
+    try {
+      const created = await createConversation(clientIdRef.current);
+      setStoredConversationId(created.conversationId);
+      setConversationId(created.conversationId);
+      setMessages([]);
+      setErrorMessage(null);
+      refreshConversations();
+    } catch (err) {
+      setErrorMessage(err instanceof Error ? err.message : 'Failed to start a new chat');
+    }
+  }
 
   async function handleSend(content: string) {
     if (!conversationId || sending) return;
@@ -65,6 +109,7 @@ export default function App() {
       const assistantId = `pending-${messageId}`;
       const assistantMessage: Message = { id: assistantId, role: 'assistant', content: '', streaming: true };
       setMessages((prev) => [...prev, userMessage, assistantMessage]);
+      refreshConversations();
 
       streamReply(streamUrl, {
         onToken: (chunk) => {
@@ -77,6 +122,7 @@ export default function App() {
             prev.map((m) => (m.id === assistantId ? { ...m, content: fullContent, streaming: false } : m)),
           );
           setSending(false);
+          refreshConversations();
         },
         onError: (message) => {
           setMessages((prev) =>
@@ -87,6 +133,7 @@ export default function App() {
             ),
           );
           setSending(false);
+          refreshConversations();
         },
       });
     } catch (err) {
@@ -96,30 +143,41 @@ export default function App() {
   }
 
   return (
-    <div className="flex h-dvh flex-col bg-slate-50">
-      <header className="border-b border-slate-200 bg-white px-4 py-3 shadow-sm">
-        <h1 className="text-lg font-semibold text-slate-800">Stateless Chat</h1>
-      </header>
+    <div className="flex h-dvh bg-slate-50">
+      <Sidebar
+        conversations={conversations}
+        currentId={conversationId}
+        loading={conversationsLoading}
+        disabled={sending}
+        onSelect={handleSelectConversation}
+        onNewChat={handleNewChat}
+      />
 
-      {initState === 'loading' && (
-        <div className="flex flex-1 items-center justify-center text-slate-400 text-sm">Loading conversation…</div>
-      )}
+      <div className="flex flex-1 flex-col">
+        <header className="border-b border-slate-200 bg-white px-4 py-3 shadow-sm">
+          <h1 className="text-lg font-semibold text-slate-800">Stateless Chat</h1>
+        </header>
 
-      {initState === 'error' && (
-        <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-red-500">
-          Could not reach the backend: {errorMessage}
-        </div>
-      )}
+        {initState === 'loading' && (
+          <div className="flex flex-1 items-center justify-center text-slate-400 text-sm">Loading conversation…</div>
+        )}
 
-      {initState === 'ready' && (
-        <>
-          <MessageList messages={messages} />
-          {errorMessage && (
-            <div className="px-4 py-1 text-center text-xs text-red-500">{errorMessage}</div>
-          )}
-          <Composer onSend={handleSend} disabled={sending} />
-        </>
-      )}
+        {initState === 'error' && (
+          <div className="flex flex-1 items-center justify-center px-6 text-center text-sm text-red-500">
+            Could not reach the backend: {errorMessage}
+          </div>
+        )}
+
+        {initState === 'ready' && (
+          <>
+            <MessageList messages={messages} />
+            {errorMessage && (
+              <div className="px-4 py-1 text-center text-xs text-red-500">{errorMessage}</div>
+            )}
+            <Composer onSend={handleSend} disabled={sending} />
+          </>
+        )}
+      </div>
     </div>
   );
 }

@@ -1,6 +1,6 @@
 import pg from "pg";
 import { env } from "./env.js";
-import type { Conversation, Message } from "./types.js";
+import type { Conversation, ConversationSummary, Message } from "./types.js";
 
 const { Pool } = pg;
 
@@ -56,6 +56,40 @@ export async function getConversation(
     [conversationId]
   );
   return rows[0] ?? null;
+}
+
+/**
+ * Lists conversations most-recently-active first. "Active" means the most
+ * recent message in the conversation, falling back to the conversation's
+ * own created_at when it has no messages yet. The last message's content
+ * comes along for free via the lateral join so the sidebar has a snippet
+ * without a second round trip per conversation.
+ */
+export async function listConversations(
+  pool: pg.Pool,
+  clientId?: string
+): Promise<ConversationSummary[]> {
+  const { rows } = await pool.query<ConversationSummary>(
+    `SELECT
+       c.id,
+       c.client_id,
+       c.created_at,
+       COALESCE(m.created_at, c.created_at) AS updated_at,
+       m.content AS last_message,
+       m.role AS last_message_role
+     FROM conversations c
+     LEFT JOIN LATERAL (
+       SELECT content, role, created_at
+       FROM messages
+       WHERE messages.conversation_id = c.id
+       ORDER BY created_at DESC
+       LIMIT 1
+     ) m ON true
+     WHERE $1::text IS NULL OR c.client_id = $1
+     ORDER BY updated_at DESC`,
+    [clientId ?? null]
+  );
+  return rows;
 }
 
 export async function insertUserMessage(

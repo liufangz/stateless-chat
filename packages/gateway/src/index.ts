@@ -6,6 +6,7 @@ import {
   initSchema,
   createConversation,
   getConversation,
+  listConversations,
   insertUserMessage,
   getMessage,
   getReply,
@@ -105,6 +106,17 @@ async function main() {
         messageId: message.id,
         streamUrl: `/conversations/${conversationId}/messages/${message.id}/stream`,
       });
+    })
+  );
+
+  // List conversations, most recently active first. Optionally scoped to a
+  // clientId so each browser only sees its own conversations.
+  app.get(
+    "/conversations",
+    asyncHandler(async (req: Request, res: Response) => {
+      const clientId = typeof req.query.clientId === "string" ? req.query.clientId.trim() : "";
+      const conversations = await listConversations(pool, clientId || undefined);
+      res.status(200).json({ conversations });
     })
   );
 
