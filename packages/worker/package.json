@@ -1,0 +1,13 @@
+{
+  "name": "@stateless-chat/worker",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@stateless-chat/shared": "*",
+    "openai": "^4.68.4"
+  }
+}
