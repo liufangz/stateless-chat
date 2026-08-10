@@ -9,6 +9,7 @@ interface SidebarProps {
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onDelete: (id: string) => void;
+  onLogout: () => void;
 }
 
 function formatTimestamp(iso: string): string {
@@ -20,7 +21,7 @@ function formatTimestamp(iso: string): string {
     : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-export function Sidebar({ conversations, currentId, loading, disabled, onSelect, onNewChat, onDelete }: SidebarProps) {
+export function Sidebar({ conversations, currentId, loading, disabled, onSelect, onNewChat, onDelete, onLogout }: SidebarProps) {
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
 
   return (
@@ -112,6 +113,16 @@ export function Sidebar({ conversations, currentId, loading, disabled, onSelect,
             </div>
           );
         })}
+      </div>
+
+      <div className="border-t border-slate-200 p-3">
+        <button
+          type="button"
+          onClick={onLogout}
+          className="w-full rounded-lg px-3 py-2 text-left text-sm font-medium text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+        >
+          Log out
+        </button>
       </div>
     </aside>
   );

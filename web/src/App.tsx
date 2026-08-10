@@ -1,15 +1,32 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { createConversation, deleteConversation, getHistory, listConversations, sendMessage, streamReply } from './lib/api';
+import {
+  ApiError,
+  checkAuthStatus,
+  createConversation,
+  deleteConversation,
+  getHistory,
+  listConversations,
+  logout,
+  sendMessage,
+  streamReply,
+} from './lib/api';
 import { getOrCreateClientId, getStoredConversationId, setStoredConversationId } from './lib/storage';
 import type { ConversationSummary, Message } from './types';
 import { MessageList } from './components/MessageList';
 import { Composer } from './components/Composer';
 import { Sidebar } from './components/Sidebar';
+import { LoginScreen } from './components/LoginScreen';
 
 type InitState = 'loading' | 'ready' | 'error';
+type AuthState = 'checking' | 'authenticated' | 'unauthenticated';
+
+function isUnauthorized(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 401;
+}
 
 export default function App() {
   const clientIdRef = useRef(getOrCreateClientId());
+  const [authState, setAuthState] = useState<AuthState>('checking');
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
   const [initState, setInitState] = useState<InitState>('loading');
@@ -22,15 +39,34 @@ export default function App() {
     try {
       const { conversations: list } = await listConversations(clientIdRef.current);
       setConversations(list);
-    } catch {
+    } catch (err) {
+      if (isUnauthorized(err)) {
+        setAuthState('unauthenticated');
+        return;
+      }
       // Sidebar refresh is best-effort - the active conversation still works
-      // even if this fails, so swallow the error instead of surfacing it.
+      // even if this fails, so swallow other errors instead of surfacing them.
     } finally {
       setConversationsLoading(false);
     }
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+    checkAuthStatus()
+      .then(() => {
+        if (!cancelled) setAuthState('authenticated');
+      })
+      .catch(() => {
+        if (!cancelled) setAuthState('unauthenticated');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (authState !== 'authenticated') return;
     let cancelled = false;
 
     async function init() {
@@ -46,7 +82,8 @@ export default function App() {
             setInitState('ready');
             refreshConversations();
             return;
-          } catch {
+          } catch (err) {
+            if (isUnauthorized(err)) throw err;
             convId = null;
           }
         }
@@ -59,16 +96,40 @@ export default function App() {
         refreshConversations();
       } catch (err) {
         if (cancelled) return;
+        if (isUnauthorized(err)) {
+          setAuthState('unauthenticated');
+          return;
+        }
         setErrorMessage(err instanceof Error ? err.message : 'Failed to reach the backend');
         setInitState('error');
       }
     }
 
+    setInitState('loading');
     init();
     return () => {
       cancelled = true;
     };
-  }, [refreshConversations]);
+  }, [authState, refreshConversations]);
+
+  function handleLoginSuccess() {
+    setAuthState('authenticated');
+  }
+
+  async function handleLogout() {
+    try {
+      await logout();
+    } catch {
+      // best-effort - the cookie may already be gone
+    }
+    setAuthState('unauthenticated');
+    setInitState('loading');
+    setConversationId(null);
+    setMessages([]);
+    setConversations([]);
+    setConversationsLoading(true);
+    setErrorMessage(null);
+  }
 
   async function handleSelectConversation(id: string) {
     if (id === conversationId || sending) return;
@@ -79,6 +140,10 @@ export default function App() {
       setMessages(history.messages);
       setErrorMessage(null);
     } catch (err) {
+      if (isUnauthorized(err)) {
+        setAuthState('unauthenticated');
+        return;
+      }
       setErrorMessage(err instanceof Error ? err.message : 'Failed to load conversation');
     }
   }
@@ -93,6 +158,10 @@ export default function App() {
       setErrorMessage(null);
       refreshConversations();
     } catch (err) {
+      if (isUnauthorized(err)) {
+        setAuthState('unauthenticated');
+        return;
+      }
       setErrorMessage(err instanceof Error ? err.message : 'Failed to start a new chat');
     }
   }
@@ -101,6 +170,10 @@ export default function App() {
     try {
       await deleteConversation(id, clientIdRef.current);
     } catch (err) {
+      if (isUnauthorized(err)) {
+        setAuthState('unauthenticated');
+        return;
+      }
       setErrorMessage(err instanceof Error ? err.message : 'Failed to delete conversation');
       return;
     }
@@ -119,6 +192,10 @@ export default function App() {
         setMessages(history.messages);
         setErrorMessage(null);
       } catch (err) {
+        if (isUnauthorized(err)) {
+          setAuthState('unauthenticated');
+          return;
+        }
         setErrorMessage(err instanceof Error ? err.message : 'Failed to load conversation');
       }
       return;
@@ -132,6 +209,10 @@ export default function App() {
       setErrorMessage(null);
       refreshConversations();
     } catch (err) {
+      if (isUnauthorized(err)) {
+        setAuthState('unauthenticated');
+        return;
+      }
       setErrorMessage(err instanceof Error ? err.message : 'Failed to start a new chat');
     }
   }
@@ -176,9 +257,26 @@ export default function App() {
         },
       });
     } catch (err) {
+      if (isUnauthorized(err)) {
+        setAuthState('unauthenticated');
+        setSending(false);
+        return;
+      }
       setErrorMessage(err instanceof Error ? err.message : 'Failed to send message');
       setSending(false);
     }
+  }
+
+  if (authState === 'checking') {
+    return (
+      <div className="flex h-dvh items-center justify-center bg-slate-50 text-sm text-slate-400">
+        Loading…
+      </div>
+    );
+  }
+
+  if (authState === 'unauthenticated') {
+    return <LoginScreen onSuccess={handleLoginSuccess} />;
   }
 
   return (
@@ -191,6 +289,7 @@ export default function App() {
         onSelect={handleSelectConversation}
         onNewChat={handleNewChat}
         onDelete={handleDeleteConversation}
+        onLogout={handleLogout}
       />
 
       <div className="flex flex-1 flex-col">

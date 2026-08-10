@@ -1,5 +1,6 @@
+import { timingSafeEqual } from "node:crypto";
 import express from "express";
-import type { Request, Response } from "express";
+import type { NextFunction, Request, Response } from "express";
 import {
   env,
   createPool,
@@ -16,8 +17,13 @@ import {
   createRedisSubscriber,
   NEW_MESSAGE_CHANNEL,
   streamChannel,
+  createAuthToken,
+  verifyAuthToken,
+  AUTH_COOKIE_NAME,
+  AUTH_COOKIE_MAX_AGE_MS,
 } from "@stateless-chat/shared";
 import type { StreamEvent } from "@stateless-chat/shared";
+import { parseCookies, serializeCookie } from "./cookies.js";
 
 const pool = createPool();
 const publisher = createRedisClient();
@@ -40,12 +46,119 @@ function asyncHandler(
   };
 }
 
+// Constant-time password compare. Buffers of unequal length are padded to
+// avoid leaking the correct password's length via timingSafeEqual's throw.
+function passwordMatches(candidate: string, expected: string): boolean {
+  const candidateBuf = Buffer.from(candidate);
+  const expectedBuf = Buffer.from(expected);
+  if (candidateBuf.length !== expectedBuf.length) {
+    timingSafeEqual(expectedBuf, expectedBuf);
+    return false;
+  }
+  return timingSafeEqual(candidateBuf, expectedBuf);
+}
+
+// Trivial in-memory throttle so a script can't hammer /login. Not durable
+// across restarts and not shared across instances - good enough for a
+// single shared password with no real account-lockout requirement.
+const LOGIN_WINDOW_MS = 60_000;
+const LOGIN_MAX_ATTEMPTS = 10;
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function isRateLimited(key: string): boolean {
+  const now = Date.now();
+  const entry = loginAttempts.get(key);
+  if (!entry || now > entry.resetAt) {
+    loginAttempts.set(key, { count: 1, resetAt: now + LOGIN_WINDOW_MS });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > LOGIN_MAX_ATTEMPTS;
+}
+
+function setAuthCookie(res: Response): void {
+  const token = createAuthToken(env.authSecret);
+  res.setHeader(
+    "Set-Cookie",
+    serializeCookie(AUTH_COOKIE_NAME, token, {
+      maxAgeSeconds: AUTH_COOKIE_MAX_AGE_MS / 1000,
+      httpOnly: true,
+      secure: true,
+      sameSite: "Lax",
+    })
+  );
+}
+
+function clearAuthCookie(res: Response): void {
+  res.setHeader(
+    "Set-Cookie",
+    serializeCookie(AUTH_COOKIE_NAME, "", {
+      maxAgeSeconds: 0,
+      httpOnly: true,
+      secure: true,
+      sameSite: "Lax",
+    })
+  );
+}
+
+function isAuthenticated(req: Request): boolean {
+  const cookies = parseCookies(req.headers.cookie);
+  return verifyAuthToken(cookies[AUTH_COOKIE_NAME], env.authSecret);
+}
+
 async function main() {
   await initSchema(pool);
   console.log("[gateway] schema ready");
 
   const app = express();
   app.use(express.json());
+
+  // --- Auth routes: unauthenticated by design, must exist before the
+  // requireAuth gate below. Never set WWW-Authenticate - that header is
+  // what triggers the browser's native basic-auth dialog we're removing.
+  app.post(
+    "/login",
+    asyncHandler(async (req: Request, res: Response) => {
+      const key = req.ip ?? "unknown";
+      if (isRateLimited(key)) {
+        res.status(429).json({ error: "too many attempts, try again later" });
+        return;
+      }
+      const password = String(req.body?.password ?? "");
+      if (!passwordMatches(password, env.authPassword)) {
+        res.status(401).json({ error: "invalid password" });
+        return;
+      }
+      setAuthCookie(res);
+      res.status(204).end();
+    })
+  );
+
+  app.post("/logout", (_req: Request, res: Response) => {
+    clearAuthCookie(res);
+    res.status(204).end();
+  });
+
+  app.get("/auth/status", (req: Request, res: Response) => {
+    if (isAuthenticated(req)) {
+      res.status(200).json({ authenticated: true });
+    } else {
+      res.status(401).json({ authenticated: false });
+    }
+  });
+
+  app.get("/health", (_req: Request, res: Response) => {
+    res.status(200).json({ ok: true });
+  });
+
+  // Everything below requires a valid auth cookie.
+  app.use((req: Request, res: Response, next: NextFunction) => {
+    if (isAuthenticated(req)) {
+      next();
+      return;
+    }
+    res.status(401).json({ error: "unauthorized" });
+  });
 
   // Create a new conversation for a client.
   app.post(
@@ -258,10 +371,6 @@ async function main() {
       }, 15000);
     })
   );
-
-  app.get("/health", (_req: Request, res: Response) => {
-    res.status(200).json({ ok: true });
-  });
 
   app.listen(env.gatewayPort, () => {
     console.log(`[gateway] listening on :${env.gatewayPort}`);

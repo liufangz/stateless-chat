@@ -25,4 +25,6 @@ export const env = {
   redisUrl: process.env.REDIS_URL ?? "redis://localhost:6380",
   gatewayPort: Number(process.env.GATEWAY_PORT ?? 3000),
   workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
+  authPassword: required("AUTH_PASSWORD"),
+  authSecret: required("AUTH_SECRET"),
 };

@@ -2,15 +2,49 @@ import type { ConversationSummary, Message } from '../types';
 
 const API_BASE = '/api';
 
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
 async function jsonFetch<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: { 'Content-Type': 'application/json' },
     ...init,
   });
   if (!res.ok) {
-    throw new Error(`${init?.method ?? 'GET'} ${path} failed: ${res.status}`);
+    throw new ApiError(res.status, `${init?.method ?? 'GET'} ${path} failed: ${res.status}`);
   }
   return res.json() as Promise<T>;
+}
+
+export function checkAuthStatus(): Promise<{ authenticated: boolean }> {
+  return jsonFetch('/auth/status');
+}
+
+export async function login(password: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  });
+  if (!res.ok) {
+    let message = 'Login failed';
+    try {
+      const body = await res.json();
+      message = typeof body?.error === 'string' ? body.error : message;
+    } catch {
+      // non-JSON error body, fall back to default message
+    }
+    throw new ApiError(res.status, message);
+  }
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${API_BASE}/logout`, { method: 'POST' });
 }
 
 export function createConversation(clientId: string): Promise<{ conversationId: string }> {
@@ -40,7 +74,7 @@ export async function deleteConversation(conversationId: string, clientId: strin
     method: 'DELETE',
   });
   if (!res.ok && res.status !== 404) {
-    throw new Error(`DELETE /conversations/${conversationId} failed: ${res.status}`);
+    throw new ApiError(res.status, `DELETE /conversations/${conversationId} failed: ${res.status}`);
   }
 }
 
