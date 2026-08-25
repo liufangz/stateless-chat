@@ -338,6 +338,18 @@ async function main() {
         if (closed) return;
         if (event.type === "token") {
           send("token", { content: event.content });
+        } else if (event.type === "tool_start") {
+          send("tool_start", {
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            args: event.args,
+          });
+        } else if (event.type === "tool_end") {
+          send("tool_end", {
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            isError: event.isError,
+          });
         } else if (event.type === "done") {
           send("done", { content: event.content });
           res.end();

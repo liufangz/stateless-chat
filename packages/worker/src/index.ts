@@ -11,7 +11,8 @@ import {
   streamChannel,
 } from "@stateless-chat/shared";
 import type { Message } from "@stateless-chat/shared";
-import { streamCompletion } from "./llm.js";
+import { runToolLoop } from "./tool-loop.js";
+import type { ToolEvent } from "./tool-loop.js";
 
 const pool = createPool();
 const publisher = createRedisClient();
@@ -29,11 +30,19 @@ async function processMessage(message: Message) {
 
   try {
     const history = await getConversationHistory(pool, message.conversation_id);
-    const content = await streamCompletion(history, (token) => {
-      publisher
-        .publish(channel, JSON.stringify({ type: "token", content: token }))
-        .catch((err) => log("publish token failed", err));
-    });
+    const content = await runToolLoop(
+      history,
+      (token) => {
+        publisher
+          .publish(channel, JSON.stringify({ type: "token", content: token }))
+          .catch((err) => log("publish token failed", err));
+      },
+      (event: ToolEvent) => {
+        publisher
+          .publish(channel, JSON.stringify(event))
+          .catch((err) => log("publish tool event failed", err));
+      }
+    );
 
     await insertAssistantMessage(
       pool,

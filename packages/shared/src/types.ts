@@ -37,4 +37,6 @@ export interface NewMessageNotification {
 export type StreamEvent =
   | { type: "token"; content: string }
   | { type: "done"; messageId: string; content: string }
-  | { type: "error"; message: string };
+  | { type: "error"; message: string }
+  | { type: "tool_start"; toolCallId: string; toolName: string; args?: unknown }
+  | { type: "tool_end"; toolCallId: string; toolName: string; isError: boolean };
