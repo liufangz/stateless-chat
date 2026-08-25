@@ -223,12 +223,17 @@ async function main() {
     })
   );
 
-  // List conversations, most recently active first. Optionally scoped to a
-  // clientId so each browser only sees its own conversations.
+  // List conversations, most recently active first. Scoped to a clientId so
+  // each browser only sees its own conversations — unless client scoping is
+  // disabled (DISABLE_CLIENT_SCOPING=true), which shows all conversations.
   app.get(
     "/conversations",
     asyncHandler(async (req: Request, res: Response) => {
-      const clientId = typeof req.query.clientId === "string" ? req.query.clientId.trim() : "";
+      const clientId = env.disableClientScoping
+        ? ""
+        : typeof req.query.clientId === "string"
+          ? req.query.clientId.trim()
+          : "";
       const conversations = await listConversations(pool, clientId || undefined);
       res.status(200).json({ conversations });
     })
@@ -236,11 +241,13 @@ async function main() {
 
   // Delete a conversation and all of its messages. Scoped by clientId (query
   // or body) when provided, so a client can't delete another client's
-  // conversation.
+  // conversation — unless client scoping is disabled.
   app.delete(
     "/conversations/:conversationId",
     asyncHandler(async (req: Request, res: Response) => {
-      const clientId = String(req.query.clientId ?? req.body?.clientId ?? "").trim();
+      const clientId = env.disableClientScoping
+        ? ""
+        : String(req.query.clientId ?? req.body?.clientId ?? "").trim();
       const deleted = await deleteConversation(
         pool,
         req.params.conversationId,

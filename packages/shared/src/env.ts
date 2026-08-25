@@ -27,4 +27,8 @@ export const env = {
   workerId: process.env.WORKER_ID ?? `worker-${process.pid}`,
   authPassword: required("AUTH_PASSWORD"),
   authSecret: required("AUTH_SECRET"),
+  // When true, the gateway ignores clientId on list/delete so every
+  // authenticated user sees all conversations (shared-history mode).
+  // Unset or "false" restores per-device clientId scoping.
+  disableClientScoping: process.env.DISABLE_CLIENT_SCOPING === "true",
 };
