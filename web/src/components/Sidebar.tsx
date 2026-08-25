@@ -1,6 +1,9 @@
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { ConversationSummary } from '../types';
 import { useMediaQuery } from '../lib/useMediaQuery';
+
+const LONG_PRESS_MS = 500;
+const LONG_PRESS_MOVE_TOLERANCE = 10;
 
 interface SidebarProps {
   conversations: ConversationSummary[];
@@ -29,6 +32,45 @@ export function Sidebar({ conversations, currentId, loading, disabled, collapsed
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const isMobile = useMediaQuery('(max-width: 639.98px)');
   const hidden = isMobile ? !mobileOpen : collapsed;
+
+  const longPressTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const longPressTriggeredRef = useRef(false);
+  const pointerStartRef = useRef<{ x: number; y: number } | null>(null);
+
+  function clearLongPress() {
+    if (longPressTimerRef.current !== null) {
+      clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+    pointerStartRef.current = null;
+  }
+
+  function handleItemPointerDown(e: React.PointerEvent, id: string) {
+    if (e.pointerType === 'mouse') return;
+    pointerStartRef.current = { x: e.clientX, y: e.clientY };
+    longPressTriggeredRef.current = false;
+    longPressTimerRef.current = setTimeout(() => {
+      longPressTriggeredRef.current = true;
+      setConfirmingId(id);
+      navigator.vibrate?.(10);
+    }, LONG_PRESS_MS);
+  }
+
+  function handleItemPointerMove(e: React.PointerEvent) {
+    const start = pointerStartRef.current;
+    if (!start) return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    if (Math.hypot(dx, dy) > LONG_PRESS_MOVE_TOLERANCE) clearLongPress();
+  }
+
+  function handleItemSelectClick(id: string) {
+    if (longPressTriggeredRef.current) {
+      longPressTriggeredRef.current = false;
+      return;
+    }
+    onSelect(id);
+  }
 
   return (
     <>
@@ -80,9 +122,17 @@ export function Sidebar({ conversations, currentId, loading, disabled, collapsed
               >
                 <button
                   type="button"
-                  onClick={() => onSelect(conversation.id)}
+                  onClick={() => handleItemSelectClick(conversation.id)}
+                  onPointerDown={(e) => handleItemPointerDown(e, conversation.id)}
+                  onPointerMove={handleItemPointerMove}
+                  onPointerUp={clearLongPress}
+                  onPointerCancel={clearLongPress}
+                  onPointerLeave={clearLongPress}
+                  onContextMenu={(e) => {
+                    if (isMobile) e.preventDefault();
+                  }}
                   disabled={disabled}
-                  className="block w-full px-3 py-2.5 pr-9 text-left transition disabled:cursor-not-allowed"
+                  className="block w-full select-none px-3 py-2.5 pr-9 text-left transition disabled:cursor-not-allowed"
                 >
                   <div className={`truncate text-sm ${isActive ? 'font-medium text-indigo-700' : 'text-slate-700'}`}>
                     {snippet}
