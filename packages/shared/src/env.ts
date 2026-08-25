@@ -31,4 +31,7 @@ export const env = {
   // authenticated user sees all conversations (shared-history mode).
   // Unset or "false" restores per-device clientId scoping.
   disableClientScoping: process.env.DISABLE_CLIENT_SCOPING === "true",
+  // When true, the worker's DEFAULT_TOOLS includes the sandboxed `bash`
+  // tool. Unset or "false" keeps it disabled.
+  toolBashEnabled: process.env.TOOL_BASH_ENABLED === "true",
 };
