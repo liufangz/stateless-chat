@@ -10,7 +10,7 @@ import {
   sendMessage,
   streamReply,
 } from './lib/api';
-import { getOrCreateClientId, getStoredConversationId, setStoredConversationId } from './lib/storage';
+import { getOrCreateClientId, getSidebarCollapsed, getStoredConversationId, setSidebarCollapsed, setStoredConversationId } from './lib/storage';
 import type { ConversationSummary, Message } from './types';
 import { MessageList } from './components/MessageList';
 import { Composer } from './components/Composer';
@@ -19,6 +19,18 @@ import { LoginScreen } from './components/LoginScreen';
 
 type InitState = 'loading' | 'ready' | 'error';
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated';
+
+function HamburgerIcon() {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
+      <path
+        fillRule="evenodd"
+        d="M2 4.75A.75.75 0 0 1 2.75 4h14.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 4.75Zm0 10.5a.75.75 0 0 1 .75-.75h14.5a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1-.75-.75ZM2 10a.75.75 0 0 1 .75-.75h14.5a.75.75 0 0 1 0 1.5H2.75A.75.75 0 0 1 2 10Z"
+        clipRule="evenodd"
+      />
+    </svg>
+  );
+}
 
 function isUnauthorized(err: unknown): boolean {
   return err instanceof ApiError && err.status === 401;
@@ -34,6 +46,15 @@ export default function App() {
   const [sending, setSending] = useState(false);
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationsLoading, setConversationsLoading] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsedState] = useState<boolean>(() => getSidebarCollapsed());
+
+  const toggleSidebar = useCallback(() => {
+    setSidebarCollapsedState((prev) => {
+      const next = !prev;
+      setSidebarCollapsed(next);
+      return next;
+    });
+  }, []);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -286,6 +307,7 @@ export default function App() {
         currentId={conversationId}
         loading={conversationsLoading}
         disabled={sending}
+        collapsed={sidebarCollapsed}
         onSelect={handleSelectConversation}
         onNewChat={handleNewChat}
         onDelete={handleDeleteConversation}
@@ -293,7 +315,17 @@ export default function App() {
       />
 
       <div className="flex flex-1 flex-col">
-        <header className="border-b border-slate-200 bg-white px-4 py-3 shadow-sm">
+        <header className="flex items-center gap-3 border-b border-slate-200 bg-white px-4 py-3 shadow-sm">
+          <button
+            type="button"
+            onClick={toggleSidebar}
+            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={!sidebarCollapsed}
+            title={sidebarCollapsed ? 'Show conversations' : 'Hide conversations'}
+            className="-ml-1 rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+          >
+            <HamburgerIcon />
+          </button>
           <h1 className="text-lg font-semibold text-slate-800">Stateless Chat</h1>
         </header>
 

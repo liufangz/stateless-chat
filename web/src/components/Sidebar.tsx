@@ -6,6 +6,7 @@ interface SidebarProps {
   currentId: string | null;
   loading: boolean;
   disabled: boolean;
+  collapsed: boolean;
   onSelect: (id: string) => void;
   onNewChat: () => void;
   onDelete: (id: string) => void;
@@ -21,12 +22,16 @@ function formatTimestamp(iso: string): string {
     : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-export function Sidebar({ conversations, currentId, loading, disabled, onSelect, onNewChat, onDelete, onLogout }: SidebarProps) {
+export function Sidebar({ conversations, currentId, loading, disabled, collapsed, onSelect, onNewChat, onDelete, onLogout }: SidebarProps) {
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-r border-slate-200 bg-white">
-      <div className="border-b border-slate-200 p-3">
+    <aside
+      inert={collapsed}
+      aria-hidden={collapsed}
+      className={`flex shrink-0 flex-col overflow-hidden border-r border-slate-200 bg-white transition-[width] duration-200 ease-in-out ${collapsed ? 'w-0' : 'w-64'}`}
+    >
+      <div className="w-64 border-b border-slate-200 p-3">
         <button
           type="button"
           onClick={onNewChat}
