@@ -25,7 +25,7 @@ export function Composer({ onSend, disabled }: ComposerProps) {
         placeholder="Message..."
         disabled={disabled}
         autoFocus
-        className="flex-1 rounded-full border border-slate-300 px-4 py-2.5 text-[15px] outline-none focus:border-indigo-500 disabled:bg-slate-50 disabled:text-slate-400"
+        className="min-w-0 flex-1 rounded-full border border-slate-300 px-4 py-2.5 text-[15px] outline-none focus:border-indigo-500 disabled:bg-slate-50 disabled:text-slate-400"
       />
       <button
         type="submit"

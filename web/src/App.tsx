@@ -11,6 +11,7 @@ import {
   streamReply,
 } from './lib/api';
 import { getOrCreateClientId, getSidebarCollapsed, getStoredConversationId, setSidebarCollapsed, setStoredConversationId } from './lib/storage';
+import { useMediaQuery } from './lib/useMediaQuery';
 import type { ConversationSummary, Message } from './types';
 import { MessageList } from './components/MessageList';
 import { Composer } from './components/Composer';
@@ -47,14 +48,24 @@ export default function App() {
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
   const [conversationsLoading, setConversationsLoading] = useState(true);
   const [sidebarCollapsed, setSidebarCollapsedState] = useState<boolean>(() => getSidebarCollapsed());
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const isMobile = useMediaQuery('(max-width: 639.98px)');
 
   const toggleSidebar = useCallback(() => {
+    if (isMobile) {
+      setSidebarOpen((prev) => !prev);
+      return;
+    }
     setSidebarCollapsedState((prev) => {
       const next = !prev;
       setSidebarCollapsed(next);
       return next;
     });
-  }, []);
+  }, [isMobile]);
+
+  useEffect(() => {
+    if (!isMobile && sidebarOpen) setSidebarOpen(false);
+  }, [isMobile, sidebarOpen]);
 
   const refreshConversations = useCallback(async () => {
     try {
@@ -154,6 +165,7 @@ export default function App() {
 
   async function handleSelectConversation(id: string) {
     if (id === conversationId || sending) return;
+    setSidebarOpen(false);
     try {
       const history = await getHistory(id);
       setStoredConversationId(id);
@@ -171,6 +183,7 @@ export default function App() {
 
   async function handleNewChat() {
     if (sending) return;
+    setSidebarOpen(false);
     try {
       const created = await createConversation(clientIdRef.current);
       setStoredConversationId(created.conversationId);
@@ -308,25 +321,27 @@ export default function App() {
         loading={conversationsLoading}
         disabled={sending}
         collapsed={sidebarCollapsed}
+        mobileOpen={sidebarOpen}
         onSelect={handleSelectConversation}
         onNewChat={handleNewChat}
         onDelete={handleDeleteConversation}
         onLogout={handleLogout}
+        onMobileClose={() => setSidebarOpen(false)}
       />
 
-      <div className="flex flex-1 flex-col">
-        <header className="flex items-center gap-3 border-b border-slate-200 bg-white px-4 py-3 shadow-sm">
+      <div className="flex min-w-0 flex-1 flex-col">
+        <header className="flex min-w-0 items-center gap-3 border-b border-slate-200 bg-white px-4 py-3 shadow-sm">
           <button
             type="button"
             onClick={toggleSidebar}
-            aria-label={sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-            aria-expanded={!sidebarCollapsed}
-            title={sidebarCollapsed ? 'Show conversations' : 'Hide conversations'}
-            className="-ml-1 rounded-lg p-1.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700"
+            aria-label={isMobile ? (sidebarOpen ? 'Close sidebar' : 'Open sidebar') : sidebarCollapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            aria-expanded={isMobile ? sidebarOpen : !sidebarCollapsed}
+            title={isMobile ? (sidebarOpen ? 'Hide conversations' : 'Show conversations') : sidebarCollapsed ? 'Show conversations' : 'Hide conversations'}
+            className="-ml-1 shrink-0 rounded-lg p-2.5 text-slate-500 transition hover:bg-slate-100 hover:text-slate-700 sm:p-1.5"
           >
             <HamburgerIcon />
           </button>
-          <h1 className="text-lg font-semibold text-slate-800">Stateless Chat</h1>
+          <h1 className="truncate text-lg font-semibold text-slate-800">Stateless Chat</h1>
         </header>
 
         {initState === 'loading' && (

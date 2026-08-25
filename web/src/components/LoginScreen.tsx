@@ -28,7 +28,7 @@ export function LoginScreen({ onSuccess }: LoginScreenProps) {
   }
 
   return (
-    <div className="flex h-dvh items-center justify-center bg-slate-50">
+    <div className="flex h-dvh items-center justify-center bg-slate-50 px-4">
       <form
         onSubmit={handleSubmit}
         className="w-full max-w-xs rounded-xl border border-slate-200 bg-white p-6 shadow-sm"
@@ -47,7 +47,7 @@ export function LoginScreen({ onSuccess }: LoginScreenProps) {
         <button
           type="submit"
           disabled={submitting || !password}
-          className="mt-4 w-full rounded-lg bg-indigo-600 px-3 py-2 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-300"
+          className="mt-4 w-full rounded-lg bg-indigo-600 px-3 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-300 sm:py-2"
         >
           {submitting ? 'Signing in…' : 'Sign in'}
         </button>
