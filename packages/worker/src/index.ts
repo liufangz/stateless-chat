@@ -4,6 +4,7 @@ import {
   claimPendingMessages,
   getConversationHistory,
   insertAssistantMessage,
+  insertToolExchange,
   markMessageStatus,
   createRedisClient,
   createRedisSubscriber,
@@ -30,7 +31,7 @@ async function processMessage(message: Message) {
 
   try {
     const history = await getConversationHistory(pool, message.conversation_id);
-    const content = await runToolLoop(
+    const { content, toolExchange } = await runToolLoop(
       history,
       (token) => {
         publisher
@@ -43,6 +44,10 @@ async function processMessage(message: Message) {
           .catch((err) => log("publish tool event failed", err));
       }
     );
+
+    if (toolExchange.length > 0) {
+      await insertToolExchange(pool, message.conversation_id, message.id, toolExchange);
+    }
 
     await insertAssistantMessage(
       pool,

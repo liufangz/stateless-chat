@@ -1,4 +1,4 @@
-import type { ConversationSummary, Message } from '../types';
+import type { ConversationSummary, Message, ToolCallDetail } from '../types';
 
 const API_BASE = '/api';
 
@@ -84,10 +84,21 @@ export function getHistory(
   return jsonFetch(`/conversations/${conversationId}/messages`);
 }
 
+export function fetchToolCalls(
+  conversationId: string,
+  userMessageId: string,
+): Promise<ToolCallDetail[]> {
+  return jsonFetch<{ toolCalls: ToolCallDetail[] }>(
+    `/conversations/${conversationId}/messages/${userMessageId}/tools`,
+  ).then((body) => body.toolCalls);
+}
+
 export interface StreamHandlers {
   onToken: (chunk: string) => void;
   onDone: (fullContent: string) => void;
   onError: (message: string) => void;
+  onToolStart?: (info: { toolCallId: string; toolName: string; args?: unknown }) => void;
+  onToolEnd?: (info: { toolCallId: string; toolName: string; isError: boolean }) => void;
 }
 
 export function streamReply(streamUrl: string, handlers: StreamHandlers): () => void {
@@ -96,6 +107,16 @@ export function streamReply(streamUrl: string, handlers: StreamHandlers): () => 
   source.addEventListener('token', (event) => {
     const { content } = JSON.parse((event as MessageEvent).data);
     handlers.onToken(content);
+  });
+
+  source.addEventListener('tool_start', (event) => {
+    const { toolCallId, toolName, args } = JSON.parse((event as MessageEvent).data);
+    handlers.onToolStart?.({ toolCallId, toolName, args });
+  });
+
+  source.addEventListener('tool_end', (event) => {
+    const { toolCallId, toolName, isError } = JSON.parse((event as MessageEvent).data);
+    handlers.onToolEnd?.({ toolCallId, toolName, isError });
   });
 
   source.addEventListener('done', (event) => {

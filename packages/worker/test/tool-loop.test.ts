@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Message } from "@stateless-chat/shared";
-import { runToolLoop, DEFAULT_TOOLS } from "../src/tool-loop.js";
+import {
+  runToolLoop,
+  DEFAULT_TOOLS,
+  HISTORY_LIMIT,
+  sliceHistoryAtTurnBoundaries,
+  rowToChatMessage,
+} from "../src/tool-loop.js";
 
 // ---------------------------------------------------------------------------
 // Fake OpenAI-compatible streaming client
@@ -116,12 +122,12 @@ describe("runToolLoop", () => {
     ]);
     const onToken = vi.fn();
 
-    const result = await runToolLoop(makeHistory(), onToken, undefined, {
+    const { content } = await runToolLoop(makeHistory(), onToken, undefined, {
       client: client as any,
       tools: [echo] as any,
     });
 
-    expect(result).toBe("Done");
+    expect(content).toBe("Done");
     expect(echo.execute).not.toHaveBeenCalled();
     expect(calls).toHaveLength(2);
     const toolMsg = calls[1].messages.find(
@@ -137,14 +143,16 @@ describe("runToolLoop", () => {
       [toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")],
     ]);
 
-    const result = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+    const { content, toolExchange } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
       client: client as any,
       tools: [echo] as any,
       maxIterations: 3,
     });
 
     expect(create).toHaveBeenCalledTimes(3);
-    expect(result).toBe(FALLBACK);
+    expect(content).toBe(FALLBACK);
+    expect(toolExchange).toHaveLength(3);
+    expect(toolExchange.every((r) => r.toolCallId === "call_x" && !r.isError)).toBe(true);
   });
 
   it("c) tool execute() throws: error fed back, loop continues to a final answer", async () => {
@@ -157,12 +165,12 @@ describe("runToolLoop", () => {
     ]);
     const onToolEvent = vi.fn();
 
-    const result = await runToolLoop(makeHistory(), vi.fn(), onToolEvent, {
+    const { content, toolExchange } = await runToolLoop(makeHistory(), vi.fn(), onToolEvent, {
       client: client as any,
       tools: [boom] as any,
     });
 
-    expect(result).toBe("ok after error");
+    expect(content).toBe("ok after error");
     const toolMsg = calls[1].messages.find(
       (m: any) => m.role === "tool" && m.tool_call_id === "call_1"
     );
@@ -171,6 +179,15 @@ describe("runToolLoop", () => {
     expect(onToolEvent).toHaveBeenCalledWith(
       expect.objectContaining({ type: "tool_end", toolCallId: "call_1", isError: true })
     );
+    expect(toolExchange).toEqual([
+      expect.objectContaining({
+        iteration: 0,
+        toolCallId: "call_1",
+        toolName: "boom",
+        isError: true,
+        result: expect.stringMatching(/error/i),
+      }),
+    ]);
   });
 
   it("d) tool returns an empty string result: handled, final answer returned", async () => {
@@ -180,12 +197,12 @@ describe("runToolLoop", () => {
       [text("final"), finish("stop")],
     ]);
 
-    const result = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+    const { content } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
       client: client as any,
       tools: [empty] as any,
     });
 
-    expect(result).toBe("final");
+    expect(content).toBe("final");
     const toolMsg = calls[1].messages.find(
       (m: any) => m.role === "tool" && m.tool_call_id === "call_1"
     );
@@ -200,12 +217,12 @@ describe("runToolLoop", () => {
       [text("answer"), finish("stop")],
     ]);
 
-    const result = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+    const { content } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
       client: client as any,
       tools: [echo] as any,
     });
 
-    expect(result).toBe("answer");
+    expect(content).toBe("answer");
     expect(echo.execute).not.toHaveBeenCalled();
     const toolMsg = calls[1].messages.find(
       (m: any) => m.role === "tool" && m.tool_call_id === "call_1"
@@ -229,13 +246,14 @@ describe("runToolLoop", () => {
     const onToken = vi.fn((t: string) => tokens.push(t));
     const onToolEvent = vi.fn();
 
-    const result = await runToolLoop(makeHistory(), onToken, onToolEvent, {
+    const { content, toolExchange } = await runToolLoop(makeHistory(), onToken, onToolEvent, {
       client: client as any,
     });
 
-    expect(result).toBe("Hi there");
+    expect(content).toBe("Hi there");
     expect(tokens.join("")).toBe("Hi there");
     expect(onToolEvent).not.toHaveBeenCalled();
+    expect(toolExchange).toEqual([]);
   });
 
   it("h) tool_start/tool_end emitted per call, in order, with correct isError", async () => {
@@ -255,12 +273,12 @@ describe("runToolLoop", () => {
     const events: any[] = [];
     const onToolEvent = vi.fn((e: any) => events.push(e));
 
-    const result = await runToolLoop(makeHistory(), vi.fn(), onToolEvent, {
+    const { content, toolExchange } = await runToolLoop(makeHistory(), vi.fn(), onToolEvent, {
       client: client as any,
       tools: [echo, boom] as any,
     });
 
-    expect(result).toBe("done");
+    expect(content).toBe("done");
 
     for (const [id, expectedError] of [
       ["call_1", false],
@@ -272,6 +290,23 @@ describe("runToolLoop", () => {
       expect(endIdx).toBeGreaterThan(startIdx);
       expect(events[endIdx].isError).toBe(expectedError);
     }
+
+    expect(toolExchange).toHaveLength(2);
+    expect(toolExchange.map((r) => r.toolCallId)).toEqual(["call_1", "call_2"]);
+    expect(toolExchange[0]).toMatchObject({
+      iteration: 0,
+      toolName: "echo",
+      arguments: '{"a":1}',
+      args: { a: 1 },
+      result: "ok",
+      isError: false,
+    });
+    expect(toolExchange[1]).toMatchObject({
+      iteration: 0,
+      toolName: "boom",
+      isError: true,
+    });
+    expect(toolExchange[1].result).toMatch(/error/i);
   });
 
   it("i) wall-clock timeout: a hung tool causes runToolLoop to reject", async () => {
@@ -296,15 +331,15 @@ describe("runToolLoop", () => {
     const tokens: string[] = [];
     const onToken = vi.fn((t: string) => tokens.push(t));
 
-    const result = await runToolLoop(makeHistory(), onToken, undefined, {
+    const { content } = await runToolLoop(makeHistory(), onToken, undefined, {
       client: client as any,
       tools: [echo] as any,
     });
 
-    expect(result).toBe("Answer: 42");
-    expect(tokens.join("")).toBe(result);
-    expect(result).not.toMatch(/error/i);
-    expect(result).not.toContain("call_1");
+    expect(content).toBe("Answer: 42");
+    expect(tokens.join("")).toBe(content);
+    expect(content).not.toMatch(/error/i);
+    expect(content).not.toContain("call_1");
   });
 
   it("k) finish_reason length with pending tool calls: auto-failed as error, loop continues", async () => {
@@ -314,18 +349,28 @@ describe("runToolLoop", () => {
       [text("recovered"), finish("stop")],
     ]);
 
-    const result = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+    const { content, toolExchange } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
       client: client as any,
       tools: [echo] as any,
     });
 
-    expect(result).toBe("recovered");
+    expect(content).toBe("recovered");
     expect(echo.execute).not.toHaveBeenCalled();
     const toolMsg = calls[1].messages.find(
       (m: any) => m.role === "tool" && m.tool_call_id === "call_1"
     );
     expect(toolMsg).toBeDefined();
     expect(toolMsg.content).toMatch(/error/i);
+
+    expect(toolExchange).toEqual([
+      expect.objectContaining({
+        iteration: 0,
+        toolCallId: "call_1",
+        toolName: "echo",
+        isError: true,
+        result: expect.stringMatching(/truncated/i),
+      }),
+    ]);
   });
 });
 
@@ -360,5 +405,148 @@ describe("DEFAULT_TOOLS", () => {
         expect(names).not.toContain(toolName);
       }
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Turn-boundary-aware history slicing
+// ---------------------------------------------------------------------------
+
+let rowSeq = 0;
+function rowBase(role: Message["role"]): Pick<
+  Message,
+  "id" | "conversation_id" | "role" | "status" | "reply_to_message_id" | "created_at"
+> {
+  const s = rowSeq++;
+  return {
+    id: `${role}-${s}`,
+    conversation_id: "conv-1",
+    role,
+    status: "done",
+    reply_to_message_id: null,
+    created_at: new Date(s * 1000).toISOString(),
+  };
+}
+
+function userRow(content: string): Message {
+  return { ...rowBase("user"), content };
+}
+
+function toolCallAssistantRow(callId: string, toolName: string, args = "{}"): Message {
+  return {
+    ...rowBase("assistant"),
+    content: "",
+    tool_calls: [{ id: callId, name: toolName, arguments: args }],
+  };
+}
+
+function toolResultRow(callId: string, toolName: string, content: string): Message {
+  return {
+    ...rowBase("tool"),
+    content,
+    tool_call_id: callId,
+    tool_name: toolName,
+  };
+}
+
+function assistantTextRow(content: string): Message {
+  return { ...rowBase("assistant"), content };
+}
+
+/** One full turn: user question -> one tool call -> final text answer. */
+function fullToolTurn(i: number): Message[] {
+  return [
+    userRow(`question ${i}`),
+    toolCallAssistantRow(`call_${i}`, "echo", "{}"),
+    toolResultRow(`call_${i}`, "echo", `result ${i}`),
+    assistantTextRow(`answer ${i}`),
+  ];
+}
+
+/** Asserts no dangling 'tool' row and no split tool-call exchange group. */
+function assertStructurallyValid(rows: Message[]) {
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].role === "tool") {
+      const prev = rows[i - 1];
+      expect(prev, `tool row at ${i} has no preceding row`).toBeDefined();
+      expect(prev.role).toBe("assistant");
+      const ids = (prev.tool_calls ?? []).map((tc) => tc.id);
+      expect(ids).toContain(rows[i].tool_call_id);
+    }
+    if (rows[i].role === "assistant" && rows[i].tool_calls && rows[i].tool_calls!.length > 0) {
+      const expectedIds = rows[i].tool_calls!.map((tc) => tc.id);
+      const following = rows.slice(i + 1, i + 1 + expectedIds.length);
+      expect(following.every((r) => r.role === "tool")).toBe(true);
+      expect(following.map((r) => r.tool_call_id)).toEqual(expectedIds);
+    }
+  }
+}
+
+describe("sliceHistoryAtTurnBoundaries", () => {
+  it("expands the window backward to the enclosing user row when the raw cut lands inside a tool exchange", () => {
+    rowSeq = 0;
+    // 6 full tool turns (4 rows each, 24 rows) + one plain turn (2 rows) = 26
+    // rows. history.length - HISTORY_LIMIT (20) = 6, which lands exactly on
+    // turn 1's 'tool' row (rows 4-7 = user, assistant tool_calls, tool,
+    // assistant final) - the classic dangling-tool-row cut.
+    const history: Message[] = [
+      ...Array.from({ length: 6 }, (_, i) => fullToolTurn(i)).flat(),
+      userRow("question 6"),
+      assistantTextRow("answer 6"),
+    ];
+    expect(history.length).toBe(26);
+    expect(history.length - HISTORY_LIMIT).toBe(6);
+    expect(history[6].role).toBe("tool");
+
+    const sliced = sliceHistoryAtTurnBoundaries(history, HISTORY_LIMIT);
+
+    // Backward expansion must walk back to turn 1's user row (index 4), not
+    // stop mid-exchange or include turn 0 at all.
+    expect(sliced[0].role).toBe("user");
+    expect(sliced[0].content).toBe("question 1");
+    expect(sliced).not.toContainEqual(expect.objectContaining({ content: "question 0" }));
+
+    assertStructurallyValid(sliced);
+  });
+
+  it("is a no-op when history is at or under the limit", () => {
+    rowSeq = 0;
+    const history = [...fullToolTurn(0), ...fullToolTurn(1)];
+    const sliced = sliceHistoryAtTurnBoundaries(history, HISTORY_LIMIT);
+    expect(sliced).toEqual(history);
+  });
+
+  it("never produces a ChatMessage sequence with a dangling tool message when mapped and sent to the LLM, exactly at the HISTORY_LIMIT boundary", async () => {
+    rowSeq = 0;
+    const history: Message[] = [
+      ...Array.from({ length: 6 }, (_, i) => fullToolTurn(i)).flat(),
+      userRow("question 6"),
+      assistantTextRow("answer 6"),
+    ];
+
+    const { client, calls } = createFakeClient([[text("final answer"), finish("stop")]]);
+
+    await runToolLoop(history, vi.fn(), undefined, { client: client as any });
+
+    expect(calls).toHaveLength(1);
+    const sent = calls[0].messages as Array<{
+      role: string;
+      tool_call_id?: string;
+      tool_calls?: Array<{ id: string }>;
+    }>;
+    expect(sent[0]).toMatchObject({ role: "system" });
+
+    for (let i = 0; i < sent.length; i++) {
+      if (sent[i].role === "tool") {
+        const prev = sent[i - 1];
+        expect(prev).toBeDefined();
+        expect(prev.role).toBe("assistant");
+        expect((prev.tool_calls ?? []).map((tc) => tc.id)).toContain(sent[i].tool_call_id);
+      }
+    }
+
+    // Sanity: matches directly mapping the same slice through rowToChatMessage.
+    const expectedSlice = sliceHistoryAtTurnBoundaries(history, HISTORY_LIMIT);
+    expect(sent.slice(1)).toEqual(expectedSlice.map(rowToChatMessage));
   });
 });

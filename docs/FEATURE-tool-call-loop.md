@@ -1,6 +1,11 @@
 # FEATURE — Tool-Call Loop for Worker LLM Replies
 
-**Status: design doc / research only. Nothing in this doc has been implemented.**
+**Status: Phases 1-3 implemented.** The loop mechanics, SSE `tool_start`/`tool_end`
+events, and the default tool set described below shipped per this doc's Parts 1-4.
+Part 5's "persist only final text" recommendation was **superseded** — Phase 3
+persists the full tool exchange (turn-boundary-aware history slicing included).
+See `docs/FEATURE-tool-call-ui.md` for what actually shipped: the Postgres schema,
+the REST contract, and the frontend tool-chip UI.
 
 ## What
 

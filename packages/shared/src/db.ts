@@ -1,6 +1,11 @@
 import pg from "pg";
 import { env } from "./env.js";
-import type { Conversation, ConversationSummary, Message } from "./types.js";
+import type {
+  Conversation,
+  ConversationSummary,
+  Message,
+  ToolExchangeRecord,
+} from "./types.js";
 
 const { Pool } = pg;
 
@@ -30,6 +35,21 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_pending ON messages(status) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_messages_reply_to ON messages(reply_to_message_id);
+
+-- Tool-call persistence (Phase 3): nullable, additive - existing rows are
+-- unaffected. tool_calls holds the assistant's issued calls for one loop
+-- iteration ({id, name, arguments}[]); tool_call_id/tool_name/tool_is_error
+-- are set only on role='tool' result rows.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_calls JSONB;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_call_id TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_name TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_is_error BOOLEAN;
+
+-- Widen the role check to allow 'tool' rows. Postgres auto-named the
+-- original constraint messages_role_check; drop/recreate is idempotent since
+-- both statements no-op (IF EXISTS) or replace on every schema init.
+ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_role_check;
+ALTER TABLE messages ADD CONSTRAINT messages_role_check CHECK (role IN ('user', 'assistant', 'tool'));
 `;
 
 export async function initSchema(pool: pg.Pool): Promise<void> {
@@ -81,7 +101,7 @@ export async function listConversations(
      LEFT JOIN LATERAL (
        SELECT content, role, created_at
        FROM messages
-       WHERE messages.conversation_id = c.id
+       WHERE messages.conversation_id = c.id AND messages.role != 'tool'
        ORDER BY created_at DESC
        LIMIT 1
      ) m ON true
@@ -117,15 +137,41 @@ export async function getMessage(
   return rows[0] ?? null;
 }
 
+/**
+ * Returns the final-text assistant reply to a user message - i.e. the
+ * assistant row without a `tool_calls` payload, not one of the intermediate
+ * tool-call rows a turn may also have produced. There is at most one such
+ * row per user message.
+ */
 export async function getReply(
   pool: pg.Pool,
   userMessageId: string
 ): Promise<Message | null> {
   const { rows } = await pool.query<Message>(
-    `SELECT * FROM messages WHERE reply_to_message_id = $1 AND role = 'assistant'`,
+    `SELECT * FROM messages
+     WHERE reply_to_message_id = $1 AND role = 'assistant' AND tool_calls IS NULL
+     ORDER BY created_at DESC
+     LIMIT 1`,
     [userMessageId]
   );
   return rows[0] ?? null;
+}
+
+/**
+ * All rows produced in reply to a single user message - the tool-call
+ * assistant row(s), their tool result rows, and the final-text assistant
+ * row, in created_at order. Used to reconstruct a turn's full tool exchange
+ * for the REST tool-detail endpoint.
+ */
+export async function getMessagesByReplyTo(
+  pool: pg.Pool,
+  userMessageId: string
+): Promise<Message[]> {
+  const { rows } = await pool.query<Message>(
+    `SELECT * FROM messages WHERE reply_to_message_id = $1 ORDER BY created_at ASC`,
+    [userMessageId]
+  );
+  return rows;
 }
 
 export async function getConversationHistory(
@@ -227,4 +273,59 @@ export async function insertAssistantMessage(
     [conversationId, content, replyToMessageId]
   );
   return rows[0];
+}
+
+/**
+ * Persists one turn's tool exchange: for each LLM round-trip that issued
+ * tool calls (grouped by `iteration`), one assistant row carrying the
+ * `tool_calls` JSONB array, immediately followed by one 'tool' row per call
+ * result. Rows are inserted sequentially (iteration order, then call order
+ * within an iteration) so `created_at` matches execution order - this is
+ * what keeps getConversationHistory's turn-boundary slicing correct.
+ * Call this before insertAssistantMessage's final-text row for the same
+ * turn, so persisted order is: tool-call exchange rows, then final text.
+ */
+export async function insertToolExchange(
+  pool: pg.Pool,
+  conversationId: string,
+  replyToMessageId: string,
+  toolExchange: ToolExchangeRecord[]
+): Promise<void> {
+  const byIteration = new Map<number, ToolExchangeRecord[]>();
+  for (const record of toolExchange) {
+    const group = byIteration.get(record.iteration);
+    if (group) {
+      group.push(record);
+    } else {
+      byIteration.set(record.iteration, [record]);
+    }
+  }
+
+  const iterations = Array.from(byIteration.keys()).sort((a, b) => a - b);
+  for (const iteration of iterations) {
+    const records = byIteration.get(iteration)!;
+    const toolCallsJson = JSON.stringify(
+      records.map((r) => ({ id: r.toolCallId, name: r.toolName, arguments: r.arguments }))
+    );
+    await pool.query(
+      `INSERT INTO messages (conversation_id, role, content, status, reply_to_message_id, tool_calls)
+       VALUES ($1, 'assistant', '', 'done', $2, $3::jsonb)`,
+      [conversationId, replyToMessageId, toolCallsJson]
+    );
+    for (const record of records) {
+      await pool.query(
+        `INSERT INTO messages
+           (conversation_id, role, content, status, reply_to_message_id, tool_call_id, tool_name, tool_is_error)
+         VALUES ($1, 'tool', $2, 'done', $3, $4, $5, $6)`,
+        [
+          conversationId,
+          record.result,
+          replyToMessageId,
+          record.toolCallId,
+          record.toolName,
+          record.isError,
+        ]
+      );
+    }
+  }
 }

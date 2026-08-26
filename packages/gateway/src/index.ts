@@ -13,6 +13,7 @@ import {
   getMessage,
   getReply,
   getConversationHistory,
+  getMessagesByReplyTo,
   createRedisClient,
   createRedisSubscriber,
   NEW_MESSAGE_CHANNEL,
@@ -24,6 +25,7 @@ import {
 } from "@stateless-chat/shared";
 import type { StreamEvent } from "@stateless-chat/shared";
 import { parseCookies, serializeCookie } from "./cookies.js";
+import { groupMessagesForClient } from "./group-history.js";
 
 const pool = createPool();
 const publisher = createRedisClient();
@@ -277,7 +279,61 @@ async function main() {
         pool,
         req.params.conversationId
       );
-      res.status(200).json({ conversationId: conversation.id, messages });
+      res.status(200).json({
+        conversationId: conversation.id,
+        messages: groupMessagesForClient(messages),
+      });
+    })
+  );
+
+  // Full tool exchange (arguments + results) for a single turn, keyed by the
+  // USER message id - that's the join key both the worker and the grouped
+  // history response use for `reply_to_message_id`. Chips in the history
+  // response carry only name/arguments/isError; this is where result
+  // content comes from, fetched on demand when a chip is expanded.
+  app.get(
+    "/conversations/:conversationId/messages/:messageId/tools",
+    asyncHandler(async (req: Request, res: Response) => {
+      const { conversationId, messageId } = req.params;
+
+      const conversation = await getConversation(pool, conversationId);
+      if (!conversation) {
+        res.status(404).json({ error: "conversation not found" });
+        return;
+      }
+      const userMessage = await getMessage(pool, messageId);
+      if (!userMessage || userMessage.conversation_id !== conversationId) {
+        res.status(404).json({ error: "message not found" });
+        return;
+      }
+
+      const rows = await getMessagesByReplyTo(pool, messageId);
+      const resultByCallId = new Map<string, { content: string; isError: boolean }>();
+      for (const row of rows) {
+        if (row.role === "tool" && row.tool_call_id) {
+          resultByCallId.set(row.tool_call_id, {
+            content: row.content,
+            isError: !!row.tool_is_error,
+          });
+        }
+      }
+
+      const toolCalls = rows
+        .filter((row) => row.role === "assistant" && row.tool_calls && row.tool_calls.length > 0)
+        .flatMap((row) =>
+          (row.tool_calls ?? []).map((tc) => {
+            const outcome = resultByCallId.get(tc.id);
+            return {
+              id: tc.id,
+              name: tc.name,
+              arguments: tc.arguments,
+              result: outcome?.content ?? "",
+              isError: outcome?.isError ?? false,
+            };
+          })
+        );
+
+      res.status(200).json({ conversationId, messageId, toolCalls });
     })
   );
 

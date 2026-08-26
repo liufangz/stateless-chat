@@ -2,6 +2,7 @@ import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import type { Message } from '../types';
+import { ToolCalls } from './ToolCalls';
 
 const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
   return (
@@ -60,8 +61,9 @@ const MarkdownContent = memo(function MarkdownContent({ content }: { content: st
   );
 });
 
-export function MessageBubble({ message }: { message: Message }) {
+export function MessageBubble({ message, conversationId }: { message: Message; conversationId: string }) {
   const isUser = message.role === 'user';
+  const hasToolCalls = !isUser && !!message.tool_calls && message.tool_calls.length > 0;
 
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -72,9 +74,20 @@ export function MessageBubble({ message }: { message: Message }) {
             : 'bg-white text-slate-800 border border-slate-200 rounded-bl-sm'
         }`}
       >
-        {isUser ? message.content : <MarkdownContent content={message.content} />}
+        {isUser ? (
+          message.content
+        ) : (
+          message.content && <MarkdownContent content={message.content} />
+        )}
         {message.streaming && (
           <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-400 align-middle" />
+        )}
+        {hasToolCalls && (
+          <ToolCalls
+            conversationId={conversationId}
+            toolCalls={message.tool_calls!}
+            replyToMessageId={message.reply_to_message_id ?? message.id}
+          />
         )}
       </div>
     </div>

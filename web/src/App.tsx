@@ -261,9 +261,17 @@ export default function App() {
 
       const userMessage: Message = { id: messageId, role: 'user', content };
       const assistantId = `pending-${messageId}`;
-      const assistantMessage: Message = { id: assistantId, role: 'assistant', content: '', streaming: true };
+      const assistantMessage: Message = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        streaming: true,
+        reply_to_message_id: messageId,
+      };
       setMessages((prev) => [...prev, userMessage, assistantMessage]);
       refreshConversations();
+
+      const activeConversationId = conversationId;
 
       streamReply(streamUrl, {
         onToken: (chunk) => {
@@ -271,11 +279,48 @@ export default function App() {
             prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + chunk } : m)),
           );
         },
-        onDone: (fullContent) => {
+        onToolStart: ({ toolCallId, toolName, args }) => {
           setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, content: fullContent, streaming: false } : m)),
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    tool_calls: [
+                      ...(m.tool_calls ?? []),
+                      {
+                        id: toolCallId,
+                        name: toolName,
+                        arguments: args !== undefined ? JSON.stringify(args) : undefined,
+                        running: true,
+                      },
+                    ],
+                  }
+                : m,
+            ),
           );
+        },
+        onToolEnd: ({ toolCallId, isError }) => {
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId
+                ? {
+                    ...m,
+                    tool_calls: (m.tool_calls ?? []).map((tc) =>
+                      tc.id === toolCallId ? { ...tc, running: false, isError } : tc,
+                    ),
+                  }
+                : m,
+            ),
+          );
+        },
+        onDone: async () => {
           setSending(false);
+          try {
+            const history = await getHistory(activeConversationId);
+            setMessages(history.messages);
+          } catch {
+            // Best-effort refresh - the streamed content already rendered above.
+          }
           refreshConversations();
         },
         onError: (message) => {
@@ -354,9 +399,9 @@ export default function App() {
           </div>
         )}
 
-        {initState === 'ready' && (
+        {initState === 'ready' && conversationId && (
           <>
-            <MessageList messages={messages} />
+            <MessageList messages={messages} conversationId={conversationId} />
             {errorMessage && (
               <div className="px-4 py-1 text-center text-xs text-red-500">{errorMessage}</div>
             )}

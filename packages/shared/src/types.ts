@@ -1,4 +1,4 @@
-export type Role = "user" | "assistant";
+export type Role = "user" | "assistant" | "tool";
 
 export type MessageStatus = "pending" | "processing" | "done" | "failed";
 
@@ -17,6 +17,14 @@ export interface ConversationSummary {
   last_message_role: Role | null;
 }
 
+// One entry of an assistant message's `tool_calls` JSONB column - mirrors the
+// OpenAI wire shape (`arguments` is the raw JSON string, not parsed).
+export interface MessageToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
 export interface Message {
   id: string;
   conversation_id: string;
@@ -25,6 +33,24 @@ export interface Message {
   status: MessageStatus;
   reply_to_message_id: string | null;
   created_at: string;
+  tool_calls?: MessageToolCall[] | null;
+  tool_call_id?: string | null;
+  tool_name?: string | null;
+  tool_is_error?: boolean | null;
+}
+
+// One executed tool call produced by the worker's tool loop, in execution
+// order. `iteration` groups calls issued in the same LLM round-trip - this is
+// what lets persistence reconstruct exactly which tool-call assistant row
+// each result belongs to (see insertToolExchange in db.ts).
+export interface ToolExchangeRecord {
+  iteration: number;
+  toolCallId: string;
+  toolName: string;
+  arguments: string;
+  args?: unknown;
+  result: string;
+  isError: boolean;
 }
 
 // Payloads published on Redis.

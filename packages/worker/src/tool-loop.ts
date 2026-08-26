@@ -1,15 +1,16 @@
 import OpenAI from "openai";
 import { env } from "@stateless-chat/shared";
-import type { Message } from "@stateless-chat/shared";
+import type { Message, ToolExchangeRecord } from "@stateless-chat/shared";
 import { DEFAULT_TOOLS } from "./tools/index.js";
 export { DEFAULT_TOOLS } from "./tools/index.js";
+export type { ToolExchangeRecord } from "@stateless-chat/shared";
 
 const SYSTEM_PROMPT =
   "You are a helpful, concise assistant in a chat application. Keep replies short. " +
   "Use the available tools when they would make your answer more accurate (e.g. exact " +
   "date/time or arithmetic) instead of guessing.";
 
-const HISTORY_LIMIT = 20;
+export const HISTORY_LIMIT = 20;
 // Multi-file survey tasks (read_file pagination, bash exploration) routinely
 // need more than 6 LLM round-trips; 6 caused truncated/fallback answers on
 // "go through the project" style prompts (verified 2026-08-26). Raised to 12
@@ -157,6 +158,75 @@ async function executeToolCall(
   }
 }
 
+// --- Turn-boundary-aware history slicing --------------------------------
+// Once tool rows exist, a raw `history.slice(-N)` can split an assistant
+// `tool_calls` row from its `tool` result rows, or include a dangling `tool`
+// row with no preceding assistant row - DeepSeek (like OpenAI) rejects a
+// `messages` array shaped like that with a 400. So instead of a plain row
+// count cut, take the last N rows, then:
+//   1. walk the start backward to the nearest preceding 'user' row (a turn
+//      boundary), so a partial exchange is never left dangling at the front;
+//   2. walk the end forward to include every 'tool' row belonging to the
+//      last included tool-call assistant row's exchange group (a no-op in
+//      practice today, since the slice is always a suffix of full history,
+//      but keeps the function correct if that ever changes).
+
+export function isToolCallAssistantRow(m: Message): boolean {
+  return m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0;
+}
+
+export function sliceHistoryAtTurnBoundaries(history: Message[], limit: number): Message[] {
+  if (history.length <= limit) return history;
+
+  let start = history.length - limit;
+  while (start > 0 && history[start].role !== "user") {
+    start--;
+  }
+
+  let end = history.length;
+  let i = start;
+  while (i < end) {
+    const row = history[i];
+    if (isToolCallAssistantRow(row)) {
+      const pendingCallIds = new Set((row.tool_calls ?? []).map((tc) => tc.id));
+      let j = i + 1;
+      while (pendingCallIds.size > 0 && j < history.length && history[j].role === "tool") {
+        pendingCallIds.delete(history[j].tool_call_id ?? "");
+        j++;
+      }
+      if (j > end) end = j;
+      i = j;
+    } else {
+      i++;
+    }
+  }
+
+  return history.slice(start, end);
+}
+
+export function rowToChatMessage(m: Message): ChatMessage {
+  if (m.role === "tool") {
+    return { role: "tool", content: m.content, tool_call_id: m.tool_call_id ?? "" };
+  }
+  if (isToolCallAssistantRow(m)) {
+    return {
+      role: "assistant",
+      content: null,
+      tool_calls: (m.tool_calls ?? []).map((tc) => ({
+        id: tc.id,
+        type: "function" as const,
+        function: { name: tc.name, arguments: tc.arguments },
+      })),
+    };
+  }
+  return { role: m.role as "user" | "assistant", content: m.content };
+}
+
+export interface RunLoopResult {
+  content: string;
+  toolExchange: ToolExchangeRecord[];
+}
+
 async function runLoopBody(
   history: Message[],
   onToken: (token: string) => void,
@@ -164,20 +234,21 @@ async function runLoopBody(
   tools: Tool[],
   client: ChatCompletionsClient,
   maxIterations: number
-): Promise<string> {
+): Promise<RunLoopResult> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
   const toolDefs = tools.map((t) => ({
     type: "function" as const,
     function: { name: t.name, description: t.description, parameters: t.parameters },
   }));
 
-  const recent = history.slice(-HISTORY_LIMIT);
+  const recent = sliceHistoryAtTurnBoundaries(history, HISTORY_LIMIT);
   const messages: ChatMessage[] = [
     { role: "system", content: SYSTEM_PROMPT },
-    ...recent.map((m) => ({ role: m.role, content: m.content })),
+    ...recent.map(rowToChatMessage),
   ];
 
   let lastAssistantText = "";
+  const toolExchange: ToolExchangeRecord[] = [];
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
     const stream = await client.chat.completions.create({
@@ -223,7 +294,7 @@ async function runLoopBody(
       .map(([, v]) => v);
 
     if (toolCalls.length === 0) {
-      return text;
+      return { content: text, toolExchange };
     }
     if (text) lastAssistantText = text;
 
@@ -243,23 +314,25 @@ async function runLoopBody(
       for (const tc of toolCalls) {
         onToolEvent?.({ type: "tool_start", toolCallId: tc.id, toolName: tc.name });
         onToolEvent?.({ type: "tool_end", toolCallId: tc.id, toolName: tc.name, isError: true });
-        messages.push({
-          role: "tool",
-          tool_call_id: tc.id,
-          content:
-            "Error: response was truncated before this tool call completed. Please retry with a smaller request.",
+        const content =
+          "Error: response was truncated before this tool call completed. Please retry with a smaller request.";
+        messages.push({ role: "tool", tool_call_id: tc.id, content });
+        toolExchange.push({
+          iteration,
+          toolCallId: tc.id,
+          toolName: tc.name,
+          arguments: tc.arguments,
+          args: tryParseArgsForEvent(tc.arguments),
+          result: content,
+          isError: true,
         });
       }
       continue;
     }
 
     for (const tc of toolCalls) {
-      onToolEvent?.({
-        type: "tool_start",
-        toolCallId: tc.id,
-        toolName: tc.name,
-        args: tryParseArgsForEvent(tc.arguments),
-      });
+      const args = tryParseArgsForEvent(tc.arguments);
+      onToolEvent?.({ type: "tool_start", toolCallId: tc.id, toolName: tc.name, args });
       const result = await executeToolCall(tc, toolsByName);
       onToolEvent?.({
         type: "tool_end",
@@ -268,6 +341,15 @@ async function runLoopBody(
         isError: result.isError,
       });
       messages.push({ role: "tool", tool_call_id: tc.id, content: result.content });
+      toolExchange.push({
+        iteration,
+        toolCallId: tc.id,
+        toolName: tc.name,
+        arguments: tc.arguments,
+        args,
+        result: result.content,
+        isError: result.isError,
+      });
     }
   }
 
@@ -275,7 +357,7 @@ async function runLoopBody(
     `[tool-loop] hit max iterations (${maxIterations}) without a final answer - ` +
       `returning ${lastAssistantText ? "the last partial answer" : "the fallback message"}`
   );
-  return lastAssistantText || FALLBACK_MESSAGE;
+  return { content: lastAssistantText || FALLBACK_MESSAGE, toolExchange };
 }
 
 export async function runToolLoop(
@@ -283,7 +365,7 @@ export async function runToolLoop(
   onToken: (token: string) => void,
   onToolEvent?: (event: ToolEvent) => void,
   options: ToolLoopOptions = {}
-): Promise<string> {
+): Promise<RunLoopResult> {
   const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const tools = options.tools ?? DEFAULT_TOOLS;
