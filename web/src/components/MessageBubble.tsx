@@ -74,6 +74,13 @@ export function MessageBubble({ message, conversationId }: { message: Message; c
             : 'bg-white text-slate-800 border border-slate-200 rounded-bl-sm'
         }`}
       >
+        {hasToolCalls && (
+          <ToolCalls
+            conversationId={conversationId}
+            toolCalls={message.tool_calls!}
+            replyToMessageId={message.reply_to_message_id ?? message.id}
+          />
+        )}
         {isUser ? (
           message.content
         ) : (
@@ -81,13 +88,6 @@ export function MessageBubble({ message, conversationId }: { message: Message; c
         )}
         {message.streaming && (
           <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-400 align-middle" />
-        )}
-        {hasToolCalls && (
-          <ToolCalls
-            conversationId={conversationId}
-            toolCalls={message.tool_calls!}
-            replyToMessageId={message.reply_to_message_id ?? message.id}
-          />
         )}
       </div>
     </div>

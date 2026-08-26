@@ -98,7 +98,7 @@ export function ToolCalls({
   }
 
   return (
-    <div className="mt-2 flex flex-col items-start gap-1">
+    <div className="mb-2 flex flex-col items-start gap-1">
       {toolCalls.map((call) => {
         const expanded = expandedId === call.id;
         const detail = details[call.id];
