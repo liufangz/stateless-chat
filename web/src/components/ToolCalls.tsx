@@ -37,7 +37,7 @@ function ToolChip({
       type="button"
       disabled={call.running}
       onClick={onToggle}
-      className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition ${
+      className={`flex max-w-full min-w-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition ${
         call.running
           ? 'cursor-default border-slate-200 bg-slate-50 text-slate-500'
           : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
@@ -46,12 +46,12 @@ function ToolChip({
       {call.running ? (
         <Spinner />
       ) : call.isError ? (
-        <span className="text-red-500">✗</span>
+        <span className="shrink-0 text-red-500">✗</span>
       ) : (
-        <span className="text-emerald-600">✓</span>
+        <span className="shrink-0 text-emerald-600">✓</span>
       )}
-      <span className="font-mono font-medium">{call.name}</span>
-      {call.arguments && <span className="text-slate-400">{shortArgs(call.arguments)}</span>}
+      <span className="min-w-0 truncate font-mono font-medium">{call.name}</span>
+      {call.arguments && <span className="min-w-0 truncate text-slate-400">{shortArgs(call.arguments)}</span>}
     </button>
   );
 }
@@ -98,12 +98,12 @@ export function ToolCalls({
   }
 
   return (
-    <div className="mb-2 flex flex-col items-start gap-1">
+    <div className="mb-2 flex max-w-full min-w-0 flex-col items-start gap-1">
       {toolCalls.map((call) => {
         const expanded = expandedId === call.id;
         const detail = details[call.id];
         return (
-          <div key={call.id} className="min-w-0">
+          <div key={call.id} className="max-w-full min-w-0">
             <ToolChip call={call} expanded={expanded} onToggle={() => toggle(call)} />
             {expanded && (
               <div className="max-w-md rounded-b-lg rounded-tr-lg border border-slate-200 bg-slate-50 p-2.5 text-xs text-slate-700">
