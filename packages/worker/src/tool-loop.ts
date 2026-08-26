@@ -14,9 +14,11 @@ export const HISTORY_LIMIT = 20;
 // Multi-file survey tasks (read_file pagination, bash exploration) routinely
 // need more than 6 LLM round-trips; 6 caused truncated/fallback answers on
 // "go through the project" style prompts (verified 2026-08-26). Raised to 12
-// with a matching timeout (DeepSeek round-trips ~3-8s each).
-const DEFAULT_MAX_ITERATIONS = 12;
-const DEFAULT_TIMEOUT_MS = 180_000;
+// with a matching timeout (DeepSeek round-trips ~3-8s each), then to 20 /
+// 300s on 2026-08-26 after a 12-iteration survey (conversation
+// a8fc3e11-ee93-44bd-b26f-a958840fef7f) still ended in the fallback message.
+const DEFAULT_MAX_ITERATIONS = 20;
+const DEFAULT_TIMEOUT_MS = 300_000;
 const FALLBACK_MESSAGE =
   "I wasn't able to finish that using my tools — could you rephrase?";
 
