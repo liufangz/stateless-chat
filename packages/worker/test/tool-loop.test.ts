@@ -345,4 +345,20 @@ describe("DEFAULT_TOOLS", () => {
       expect(typeof tool.execute).toBe("function");
     }
   });
+
+  it("includes each file tool only when its own env flag is set", () => {
+    const names = DEFAULT_TOOLS.map((t) => t.name);
+    const flags: Array<[string, string]> = [
+      ["TOOL_READ_FILE_ENABLED", "read_file"],
+      ["TOOL_WRITE_FILE_ENABLED", "write_file"],
+      ["TOOL_EDIT_FILE_ENABLED", "edit_file"],
+    ];
+    for (const [envVar, toolName] of flags) {
+      if (process.env[envVar] === "true") {
+        expect(names).toContain(toolName);
+      } else {
+        expect(names).not.toContain(toolName);
+      }
+    }
+  });
 });

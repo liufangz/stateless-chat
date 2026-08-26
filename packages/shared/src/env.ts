@@ -34,4 +34,11 @@ export const env = {
   // When true, the worker's DEFAULT_TOOLS includes the sandboxed `bash`
   // tool. Unset or "false" keeps it disabled.
   toolBashEnabled: process.env.TOOL_BASH_ENABLED === "true",
+  // File tools run in-process (not docker-routed) - each flag requires a
+  // worker restart to take effect, same as toolBashEnabled. write_file
+  // should not be enabled without read_file in practice (the model needs to
+  // read back drafted content), though nothing enforces that here.
+  toolReadFileEnabled: process.env.TOOL_READ_FILE_ENABLED === "true",
+  toolWriteFileEnabled: process.env.TOOL_WRITE_FILE_ENABLED === "true",
+  toolEditFileEnabled: process.env.TOOL_EDIT_FILE_ENABLED === "true",
 };

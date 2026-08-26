@@ -5,8 +5,8 @@ const OUTPUT_LIMIT = 4000;
 const TRUNCATION_SUFFIX = "\n...[output truncated]";
 const DEFAULT_TIMEOUT_MS = 20_000;
 
-const REPO_ROOT = "/home/ubuntu/stateless-chat";
-const WORKSPACE_DIR = "/home/ubuntu/.stateless-chat-workspace";
+export const REPO_ROOT = "/home/ubuntu/stateless-chat";
+export const WORKSPACE_DIR = "/home/ubuntu/.stateless-chat-workspace";
 
 export interface SpawnResult {
   stdout: string;
