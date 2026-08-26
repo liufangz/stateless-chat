@@ -331,10 +331,13 @@ describe("runToolLoop", () => {
 
 describe("DEFAULT_TOOLS", () => {
   it("exposes get_current_datetime and calculator with the Tool shape", () => {
-    expect(DEFAULT_TOOLS).toHaveLength(2);
+    // Length depends on env: bash is appended when TOOL_BASH_ENABLED=true
     const names = DEFAULT_TOOLS.map((t) => t.name);
     expect(names).toContain("get_current_datetime");
     expect(names).toContain("calculator");
+    if (process.env.TOOL_BASH_ENABLED === "true") {
+      expect(names).toContain("bash");
+    }
     for (const tool of DEFAULT_TOOLS) {
       expect(typeof tool.name).toBe("string");
       expect(typeof tool.description).toBe("string");

@@ -169,10 +169,14 @@ describe("createBashTool execute()", () => {
 });
 
 describe("DEFAULT_TOOLS", () => {
-  it("always includes datetime and calculator, and excludes bash when TOOL_BASH_ENABLED is unset", () => {
+  it("always includes datetime and calculator; bash only when TOOL_BASH_ENABLED=true", () => {
     const names = DEFAULT_TOOLS.map((t) => t.name);
     expect(names).toContain("get_current_datetime");
     expect(names).toContain("calculator");
-    expect(names).not.toContain("bash");
+    if (process.env.TOOL_BASH_ENABLED === "true") {
+      expect(names).toContain("bash");
+    } else {
+      expect(names).not.toContain("bash");
+    }
   });
 });
