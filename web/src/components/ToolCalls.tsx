@@ -23,7 +23,7 @@ function Spinner() {
   );
 }
 
-function ToolChip({
+function ToolBubble({
   call,
   expanded,
   onToggle,
@@ -33,26 +33,27 @@ function ToolChip({
   onToggle: () => void;
 }) {
   return (
-    <button
-      type="button"
-      disabled={call.running}
-      onClick={onToggle}
-      className={`flex max-w-full min-w-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-xs transition ${
-        call.running
-          ? 'cursor-default border-slate-200 bg-slate-50 text-slate-500'
-          : 'border-slate-200 bg-slate-50 text-slate-600 hover:bg-slate-100'
-      } ${expanded ? 'rounded-b-none border-b-transparent' : ''}`}
-    >
-      {call.running ? (
-        <Spinner />
-      ) : call.isError ? (
-        <span className="shrink-0 text-red-500">✗</span>
-      ) : (
-        <span className="shrink-0 text-emerald-600">✓</span>
-      )}
-      <span className="min-w-0 truncate font-mono font-medium">{call.name}</span>
-      {call.arguments && <span className="min-w-0 truncate text-slate-400">{shortArgs(call.arguments)}</span>}
-    </button>
+    <div className="overflow-hidden rounded-2xl rounded-bl-sm border border-slate-200 bg-white shadow-sm">
+      <button
+        type="button"
+        disabled={call.running}
+        onClick={onToggle}
+        className={`flex w-full min-w-0 items-center gap-2 px-3 py-2 text-left text-sm transition ${
+          call.running ? 'cursor-default bg-slate-50 text-slate-500' : 'text-slate-600 hover:bg-slate-50'
+        } ${expanded ? 'bg-slate-50' : ''}`}
+      >
+        {call.running ? (
+          <Spinner />
+        ) : call.isError ? (
+          <span className="shrink-0 text-red-500">✗</span>
+        ) : (
+          <span className="shrink-0 text-emerald-600">✓</span>
+        )}
+        <span className="min-w-0 truncate font-mono font-medium">{call.name}</span>
+        {call.arguments && <span className="min-w-0 truncate text-slate-400">{shortArgs(call.arguments)}</span>}
+        <span className={`ml-auto shrink-0 text-slate-300 transition-transform ${expanded ? 'rotate-180' : ''}`}>▾</span>
+      </button>
+    </div>
   );
 }
 
@@ -98,15 +99,15 @@ export function ToolCalls({
   }
 
   return (
-    <div className="mb-2 flex max-w-full min-w-0 flex-col items-start gap-1">
+    <div className="mb-2 flex w-full max-w-full min-w-0 flex-col items-start gap-2">
       {toolCalls.map((call) => {
         const expanded = expandedId === call.id;
         const detail = details[call.id];
         return (
           <div key={call.id} className="max-w-full min-w-0">
-            <ToolChip call={call} expanded={expanded} onToggle={() => toggle(call)} />
+            <ToolBubble call={call} expanded={expanded} onToggle={() => toggle(call)} />
             {expanded && (
-              <div className="max-w-md rounded-b-lg rounded-tr-lg border border-slate-200 bg-slate-50 p-2.5 text-xs text-slate-700">
+              <div className="border-x border-b border-slate-200 bg-slate-50 p-2.5 text-xs text-slate-700 shadow-sm">
                 {loadingId === call.id && !detail && <div className="text-slate-400">Loading…</div>}
                 {error && !detail && <div className="text-red-500">{error}</div>}
                 {detail && (

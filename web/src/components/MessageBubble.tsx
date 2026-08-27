@@ -75,22 +75,24 @@ export function MessageBubble({ message, conversationId }: { message: Message; c
             replyToMessageId={message.reply_to_message_id ?? message.id}
           />
         )}
-        <div
-          className={`min-w-0 rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed break-words shadow-sm ${
-            isUser
-              ? 'bg-indigo-600 text-white rounded-br-sm whitespace-pre-wrap'
-              : 'bg-white text-slate-800 border border-slate-200 rounded-bl-sm'
-          }`}
-        >
-          {isUser ? (
-            message.content
-          ) : (
-            message.content && <MarkdownContent content={message.content} />
-          )}
-          {message.streaming && (
-            <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-400 align-middle" />
-          )}
-        </div>
+        {(isUser || message.content || (message.streaming && !hasToolCalls)) && (
+          <div
+            className={`min-w-0 rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed break-words shadow-sm ${
+              isUser
+                ? 'bg-indigo-600 text-white rounded-br-sm whitespace-pre-wrap'
+                : 'bg-white text-slate-800 border border-slate-200 rounded-bl-sm'
+            }`}
+          >
+            {isUser ? (
+              message.content
+            ) : (
+              message.content && <MarkdownContent content={message.content} />
+            )}
+            {message.streaming && (
+              <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-400 align-middle" />
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

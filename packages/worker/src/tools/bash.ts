@@ -1,12 +1,14 @@
 import { spawn } from "node:child_process";
+import path from "node:path";
 import type { Tool } from "../tool-loop.js";
 
 const OUTPUT_LIMIT = 4000;
 const TRUNCATION_SUFFIX = "\n...[output truncated]";
 const DEFAULT_TIMEOUT_MS = 20_000;
+const EXEC_USER = "opc";
 
 export const REPO_ROOT = "/home/ubuntu/stateless-chat";
-export const WORKSPACE_DIR = "/home/ubuntu/.stateless-chat-workspace";
+export const DEFAULT_CWD = "/home/ubuntu";
 
 export interface SpawnResult {
   stdout: string;
@@ -16,49 +18,31 @@ export interface SpawnResult {
 export type SpawnFn = (args: string[], input: string) => Promise<SpawnResult>;
 
 /**
- * Pure — returns the exact docker run argv. Tests assert this array directly,
- * so the sandbox flags (no network, read-only repo, dropped caps, non-root,
- * resource limits) are locked down independent of the execution path.
+ * Pure — returns the exact `sudo` argv used to run the command as uid 1000
+ * (opc, a non-sudo user) on the host. Tests assert this array directly so the
+ * privilege-drop (-u opc) and the isolated PATH/HOME can't be silently
+ * dropped. nodeBinDir is prepended to PATH so `node`/`npm`/`npx` resolve for
+ * opc even though it doesn't own the worker's node install.
  */
-export function buildBashDockerArgs(): string[] {
+export function buildBashExecArgs(
+  nodeBinDir: string = path.dirname(process.execPath)
+): string[] {
   return [
-    "run",
-    "-i",
-    "--rm",
-    "--network",
-    "none",
-    "--cap-drop",
-    "ALL",
-    "--security-opt",
-    "no-new-privileges",
-    "--memory",
-    "256m",
-    "--pids-limit",
-    "64",
-    "--cpus",
-    "0.5",
+    "-n",
     "-u",
-    "1000:1000",
-    "--read-only",
-    "--tmpfs",
-    "/tmp:rw,size=16m",
-    "-e",
-    "HOME=/work",
-    "-v",
-    `${REPO_ROOT}:/repo:ro`,
-    "-v",
-    `${WORKSPACE_DIR}:/work:rw`,
-    "-w",
-    "/work",
-    "node:22-slim",
-    "/bin/bash",
+    EXEC_USER,
+    "--",
+    "env",
+    "HOME=/tmp",
+    `PATH=${nodeBinDir}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
+    "bash",
     "-s",
   ];
 }
 
 function defaultSpawnFn(args: string[], input: string): Promise<SpawnResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("docker", args, { stdio: ["pipe", "pipe", "pipe"] });
+    const child = spawn("sudo", args, { cwd: DEFAULT_CWD, stdio: ["pipe", "pipe", "pipe"] });
     let stdout = "";
 
     child.stdout.on("data", (chunk) => {
@@ -98,11 +82,11 @@ export async function runBash(
 
   let result: SpawnResult;
   try {
-    result = await Promise.race([spawnFn(buildBashDockerArgs(), script), timeout]);
+    result = await Promise.race([spawnFn(buildBashExecArgs(), script), timeout]);
   } catch (err) {
     if (err instanceof Error && /ENOENT/.test(err.message)) {
       throw new Error(
-        `bash tool failed: docker is not available (${err.message})`
+        `bash tool failed: sudo is not available (${err.message})`
       );
     }
     throw err;
@@ -122,14 +106,14 @@ export function createBashTool(options?: {
   return {
     name: "bash",
     description:
-      "Run a shell command in a sandboxed docker container with no network access. " +
-      "A scratch workspace is mounted read-write at /work; the repo is mounted read-only at /repo.",
+      "Run a shell command on the host as a non-privileged user (uid 1000). " +
+      "Default cwd: /home/ubuntu (all projects readable, only the repo writable).",
     parameters: {
       type: "object",
       properties: {
         command: {
           type: "string",
-          description: "Shell command to run (bash) in the sandbox",
+          description: "Shell command to run (bash) on the host",
         },
       },
       required: ["command"],

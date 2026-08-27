@@ -9,7 +9,7 @@ import { EDIT_FILE_TOOL } from "./edit-file.js";
 
 export { getCurrentDatetimeTool } from "./datetime.js";
 export { calculatorTool, evaluateExpression } from "./calculator.js";
-export { BASH_TOOL, createBashTool, buildBashDockerArgs, runBash } from "./bash.js";
+export { BASH_TOOL, createBashTool, buildBashExecArgs, runBash } from "./bash.js";
 export { READ_FILE_TOOL, createReadFileTool } from "./read-file.js";
 export { WRITE_FILE_TOOL, createWriteFileTool } from "./write-file.js";
 export { EDIT_FILE_TOOL, createEditFileTool } from "./edit-file.js";

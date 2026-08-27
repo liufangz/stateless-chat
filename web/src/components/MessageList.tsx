@@ -18,7 +18,7 @@ export function MessageList({ messages, conversationId }: { messages: Message[];
   }
 
   return (
-    <div className="flex-1 space-y-3 overflow-y-auto px-4 py-6">
+    <div className="flex-1 space-y-2 overflow-y-auto px-4 py-6">
       {messages.map((message) => (
         <MessageBubble key={message.id} message={message} conversationId={conversationId} />
       ))}

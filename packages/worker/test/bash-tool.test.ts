@@ -1,70 +1,37 @@
 import { describe, it, expect, vi } from "vitest";
+import path from "node:path";
 import {
-  buildBashDockerArgs,
+  buildBashExecArgs,
   runBash,
   createBashTool,
   type SpawnResult,
 } from "../src/tools/bash.js";
 import { DEFAULT_TOOLS } from "../src/tool-loop.js";
 
-describe("buildBashDockerArgs", () => {
-  it("returns the exact sandboxed docker run argv", () => {
-    const args = buildBashDockerArgs();
+describe("buildBashExecArgs", () => {
+  it("returns the exact sudo argv for a given nodeBinDir", () => {
+    const args = buildBashExecArgs("/opt/node/bin");
     expect(args).toEqual([
-      "run",
-      "-i",
-      "--rm",
-      "--network",
-      "none",
-      "--cap-drop",
-      "ALL",
-      "--security-opt",
-      "no-new-privileges",
-      "--memory",
-      "256m",
-      "--pids-limit",
-      "64",
-      "--cpus",
-      "0.5",
+      "-n",
       "-u",
-      "1000:1000",
-      "--read-only",
-      "--tmpfs",
-      "/tmp:rw,size=16m",
-      "-e",
-      "HOME=/work",
-      "-v",
-      "/home/ubuntu/stateless-chat:/repo:ro",
-      "-v",
-      "/home/ubuntu/.stateless-chat-workspace:/work:rw",
-      "-w",
-      "/work",
-      "node:22-slim",
-      "/bin/bash",
+      "opc",
+      "--",
+      "env",
+      "HOME=/tmp",
+      "PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+      "bash",
       "-s",
     ]);
   });
 
-  it("contains every required sandbox flag", () => {
-    const args = buildBashDockerArgs();
-    for (const flag of [
-      "--network",
-      "none",
-      "--rm",
-      "--cap-drop",
-      "ALL",
-      "--read-only",
-      "-u",
-      "1000:1000",
-      "-w",
-      "/work",
-      "/bin/bash",
-      "-s",
-    ]) {
+  it("defaults nodeBinDir to the dirname of process.execPath", () => {
+    const args = buildBashExecArgs();
+    for (const flag of ["-n", "-u", "opc", "--", "env", "HOME=/tmp", "bash", "-s"]) {
       expect(args).toContain(flag);
     }
-    expect(args.some((a) => a.endsWith(":ro"))).toBe(true);
-    expect(args.some((a) => a.endsWith(":rw") || a.includes(":rw,"))).toBe(true);
+    const pathArg = args.find((a) => a.startsWith("PATH="));
+    expect(pathArg).toBeDefined();
+    expect(pathArg!.split("=")[1]!.split(":")[0]).toBe(path.dirname(process.execPath));
   });
 });
 
@@ -83,10 +50,10 @@ describe("runBash", () => {
     expect(result).toEqual({ stdout: "hello\n", code: 0 });
   });
 
-  it("passes the exact docker args from buildBashDockerArgs to spawnFn", async () => {
+  it("passes the exact sudo args from buildBashExecArgs to spawnFn", async () => {
     const spawnFn = vi.fn(async (): Promise<SpawnResult> => ({ stdout: "", code: 0 }));
     await runBash("true", spawnFn);
-    expect(spawnFn).toHaveBeenCalledWith(buildBashDockerArgs(), "true");
+    expect(spawnFn).toHaveBeenCalledWith(buildBashExecArgs(), "true");
   });
 
   it("truncates output over 4000 chars with a truncation suffix", async () => {
@@ -109,12 +76,12 @@ describe("runBash", () => {
     expect(result.stdout).toBe(short);
   });
 
-  it("rejects when spawnFn throws (docker unavailable)", async () => {
+  it("rejects when spawnFn throws (sudo unavailable)", async () => {
     const spawnFn = vi.fn(async (): Promise<SpawnResult> => {
-      throw new Error("spawn docker ENOENT");
+      throw new Error("spawn sudo ENOENT");
     });
 
-    await expect(runBash("cmd", spawnFn)).rejects.toThrow(/docker/i);
+    await expect(runBash("cmd", spawnFn)).rejects.toThrow(/sudo/i);
   });
 
   it("rejects after the injected timeout when spawnFn never resolves", async () => {
@@ -143,13 +110,13 @@ describe("createBashTool execute()", () => {
     await expect(tool.execute({ command: "false" })).rejects.toThrow();
   });
 
-  it("throws a clear error when docker itself is unavailable", async () => {
+  it("throws a clear error when sudo itself is unavailable", async () => {
     const spawnFn = vi.fn(async (): Promise<SpawnResult> => {
-      throw new Error("spawn docker ENOENT");
+      throw new Error("spawn sudo ENOENT");
     });
     const tool = createBashTool({ spawnFn });
 
-    await expect(tool.execute({ command: "echo hi" })).rejects.toThrow(/docker/i);
+    await expect(tool.execute({ command: "echo hi" })).rejects.toThrow(/sudo/i);
   });
 
   it("throws when the sandboxed command hangs past the per-tool timeout", async () => {
