@@ -41,4 +41,21 @@ export const env = {
   toolReadFileEnabled: process.env.TOOL_READ_FILE_ENABLED === "true",
   toolWriteFileEnabled: process.env.TOOL_WRITE_FILE_ENABLED === "true",
   toolEditFileEnabled: process.env.TOOL_EDIT_FILE_ENABLED === "true",
+  // History window fed to the LLM per turn, in ROWS (not tokens). 0 =
+  // unlimited - the entire conversation is passed without slicing. Default
+  // 20 keeps the token-bounded behavior; tool-heavy turns inflate row count
+  // fast, so unlimited risks DeepSeek 400 / overflow on long chats. Ignored
+  // when compactionEnabled is true - compaction owns the budget instead.
+  toolLoopHistoryLimit: Number(process.env.TOOL_LOOP_HISTORY_LIMIT ?? 20),
+  // pi-style token-budgeted auto-compaction: summarizes old conversation
+  // turns with the LLM instead of hard-slicing rows. Master switch - when
+  // false, tool-loop falls back to the row-slice behavior above unchanged.
+  compactionEnabled: (process.env.COMPACTION_ENABLED ?? "true") === "true",
+  // Trigger threshold, in estimated tokens (system + summary + all
+  // messages). Crossing this triggers a compaction pass before the next LLM
+  // call.
+  compactionThresholdTokens: Number(process.env.COMPACTION_THRESHOLD_TOKENS ?? 40000),
+  // How much of the newest context (in estimated tokens) survives a
+  // compaction pass, walking backward from the newest message.
+  compactionKeepRecentTokens: Number(process.env.COMPACTION_KEEP_RECENT_TOKENS ?? 20000),
 };

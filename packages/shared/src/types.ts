@@ -58,6 +58,20 @@ export interface ToolExchangeRecord {
   isError: boolean;
 }
 
+// pi-style token-budgeted auto-compaction: one row per compaction pass. See
+// packages/worker/src/compaction.ts for the summarization logic that
+// produces these.
+export interface Compaction {
+  id: string;
+  conversation_id: string;
+  summary: string;
+  first_kept_message_id: string;
+  tokens_before: number;
+  prompt_tokens: number | null;
+  completion_tokens: number | null;
+  created_at: string;
+}
+
 // Payloads published on Redis.
 
 export interface NewMessageNotification {

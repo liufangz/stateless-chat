@@ -1,9 +1,12 @@
+import { randomUUID } from "node:crypto";
 import {
   env,
   createPool,
   claimPendingMessages,
   getConversationHistory,
+  getLatestCompaction,
   insertAssistantMessage,
+  insertCompaction,
   insertToolExchange,
   markMessageStatus,
   createRedisClient,
@@ -13,7 +16,7 @@ import {
 } from "@stateless-chat/shared";
 import type { Message } from "@stateless-chat/shared";
 import { runToolLoop } from "./tool-loop.js";
-import type { ToolEvent } from "./tool-loop.js";
+import type { CompactionEntry, ToolEvent } from "./tool-loop.js";
 
 const pool = createPool();
 const publisher = createRedisClient();
@@ -31,6 +34,7 @@ async function processMessage(message: Message) {
 
   try {
     const history = await getConversationHistory(pool, message.conversation_id);
+    const latestCompaction = await getLatestCompaction(pool, message.conversation_id);
     const { content, toolExchange, usage } = await runToolLoop(
       history,
       (token) => {
@@ -42,6 +46,27 @@ async function processMessage(message: Message) {
         publisher
           .publish(channel, JSON.stringify(event))
           .catch((err) => log("publish tool event failed", err));
+      },
+      {
+        compaction: {
+          enabled: env.compactionEnabled,
+          thresholdTokens: env.compactionThresholdTokens,
+          keepRecentTokens: env.compactionKeepRecentTokens,
+          previousSummary: latestCompaction?.summary ?? null,
+          previousSummaryFirstKeptMessageId: latestCompaction?.first_kept_message_id ?? null,
+          onCompaction: async (entry: CompactionEntry) => {
+            log(`compact: ${entry.tokensBefore} tokens -> summary`);
+            await insertCompaction(pool, {
+              id: randomUUID(),
+              conversationId: message.conversation_id,
+              summary: entry.summary,
+              firstKeptMessageId: entry.firstKeptMessageId,
+              tokensBefore: entry.tokensBefore,
+              promptTokens: entry.promptTokens,
+              completionTokens: entry.completionTokens,
+            });
+          },
+        },
       }
     );
 

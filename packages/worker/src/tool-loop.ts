@@ -2,6 +2,17 @@ import OpenAI from "openai";
 import { env } from "@stateless-chat/shared";
 import type { Message, ToolExchangeRecord } from "@stateless-chat/shared";
 import { DEFAULT_TOOLS } from "./tools/index.js";
+import {
+  applyCompaction,
+  estimateMessagesTokens,
+  findAssistantCutPoint,
+  findLastUserIndex,
+  findTurnCutPoint,
+  shouldCompact,
+  summarize,
+  summarizeTurnPrefix,
+} from "./compaction.js";
+import type { SummarizationClient } from "./compaction.js";
 export { DEFAULT_TOOLS } from "./tools/index.js";
 export type { ToolExchangeRecord } from "@stateless-chat/shared";
 
@@ -17,8 +28,10 @@ export const HISTORY_LIMIT = 20;
 // with a matching timeout (DeepSeek round-trips ~3-8s each), then to 20 /
 // 300s on 2026-08-26 after a 12-iteration survey (conversation
 // a8fc3e11-ee93-44bd-b26f-a958840fef7f) still ended in the fallback message.
-const DEFAULT_MAX_ITERATIONS = 20;
-const DEFAULT_TIMEOUT_MS = 300_000;
+// Raised to 50 / 600s on 2026-08-27 at liufangz's request (timeout must
+// scale with iterations: 50 x ~8s worst-case round-trips > 300s).
+const DEFAULT_MAX_ITERATIONS = 50;
+const DEFAULT_TIMEOUT_MS = 600_000;
 const FALLBACK_MESSAGE =
   "I wasn't able to finish that using my tools — could you rephrase?";
 
@@ -93,11 +106,42 @@ export type ToolEvent =
   | { type: "tool_start"; toolCallId: string; toolName: string; args?: unknown }
   | { type: "tool_end"; toolCallId: string; toolName: string; isError: boolean };
 
+export interface CompactionEntry {
+  summary: string;
+  firstKeptMessageId: string;
+  tokensBefore: number;
+  promptTokens: number | null;
+  completionTokens: number | null;
+}
+
+export interface CompactionRuntimeOptions {
+  enabled: boolean;
+  thresholdTokens: number;
+  keepRecentTokens: number;
+  /** Summary from the conversation's most recent compaction, if any. */
+  previousSummary: string | null;
+  /**
+   * id of `previousSummary`'s first-kept row - where the next summarization
+   * span should start, instead of the conversation start. Not part of pi's
+   * literal ToolLoopOptions surface, but required to honor "the summarized
+   * span starts at the previous compaction's kept boundary" without
+   * re-summarizing already-summarized history on every pass.
+   */
+  previousSummaryFirstKeptMessageId?: string | null;
+  /**
+   * Called once a pre-turn compaction pass durably needs persisting. Errors
+   * are logged, not thrown - a failed persist doesn't invalidate the
+   * in-memory compaction already applied to this turn's messages.
+   */
+  onCompaction?: (entry: CompactionEntry) => Promise<void> | void;
+}
+
 export interface ToolLoopOptions {
   client?: ChatCompletionsClient;
   tools?: Tool[];
   maxIterations?: number;
   timeoutMs?: number;
+  compaction?: CompactionRuntimeOptions;
 }
 
 // --- Loop mechanics -----------------------------------------------------
@@ -246,13 +290,122 @@ export interface RunLoopResult {
   usage: RunLoopUsage | null;
 }
 
+/**
+ * Pre-turn compaction: if the full history (system + every row) is over
+ * budget, summarize everything before the cut point and replace it with one
+ * summary message. Falls back to the full uncompacted array whenever
+ * there's nothing worth cutting or the summarization call itself fails -
+ * compaction is a budget optimization, never a hard requirement for the
+ * turn to proceed.
+ */
+async function buildCompactedMessages(
+  history: Message[],
+  client: ChatCompletionsClient,
+  compaction: CompactionRuntimeOptions
+): Promise<ChatMessage[]> {
+  const systemMessage: ChatMessage = { role: "system", content: SYSTEM_PROMPT };
+  const fullChat: ChatMessage[] = [systemMessage, ...history.map(rowToChatMessage)];
+
+  if (!shouldCompact(fullChat, compaction.thresholdTokens)) {
+    return fullChat;
+  }
+
+  const boundaryId = compaction.previousSummaryFirstKeptMessageId ?? null;
+  const boundaryIndex = boundaryId ? history.findIndex((r) => r.id === boundaryId) : -1;
+  const startIndex = boundaryIndex >= 0 ? boundaryIndex : 0;
+
+  const cut = findTurnCutPoint(history, compaction.keepRecentTokens, startIndex);
+  if (!cut) {
+    return fullChat;
+  }
+
+  const rowsToSummarize = history.slice(startIndex, cut.index);
+  const summarizationClient = client as unknown as SummarizationClient;
+
+  try {
+    const { summary, usage } = await summarize(
+      summarizationClient,
+      rowsToSummarize,
+      compaction.previousSummary,
+      env.openaiModel
+    );
+
+    if (compaction.onCompaction) {
+      try {
+        await compaction.onCompaction({
+          summary,
+          firstKeptMessageId: cut.rowId,
+          tokensBefore: estimateMessagesTokens(fullChat),
+          promptTokens: usage.promptTokens,
+          completionTokens: usage.completionTokens,
+        });
+      } catch (err) {
+        console.error("[tool-loop] onCompaction persistence failed", err);
+      }
+    }
+
+    const summaryMessage: ChatMessage = {
+      role: "system",
+      content: `Checkpoint summary of the earlier conversation:\n${summary}`,
+    };
+    const keptRows = history.slice(cut.index);
+    return [systemMessage, summaryMessage, ...keptRows.map(rowToChatMessage)];
+  } catch (err) {
+    console.error("[tool-loop] pre-turn compaction failed, continuing uncompacted", err);
+    return fullChat;
+  }
+}
+
+/**
+ * Mid-loop split-turn compaction: called at the top of every iteration.
+ * Tool results appended by earlier iterations can push a single still-open
+ * turn over budget on its own - split it by summarizing the turn's prefix
+ * (up to but not including the most recent assistant message that keeps us
+ * under budget) and splicing that summary in place of the prefix. This is
+ * loop-local: never persisted, since the next turn's pre-turn compaction
+ * re-summarizes the full span from the last durable boundary anyway.
+ */
+async function maybeSplitTurn(
+  messages: ChatMessage[],
+  client: ChatCompletionsClient,
+  compaction: CompactionRuntimeOptions
+): Promise<ChatMessage[]> {
+  if (!shouldCompact(messages, compaction.thresholdTokens)) {
+    return messages;
+  }
+
+  const turnStartIndex = findLastUserIndex(messages);
+  if (turnStartIndex < 0) return messages;
+
+  const cut = findAssistantCutPoint(messages, turnStartIndex, compaction.keepRecentTokens);
+  if (!cut) return messages;
+
+  const hasExistingSummary = messages.length > 1 && messages[1].role === "system";
+  const keepPrefixCount = hasExistingSummary ? 2 : 1;
+  const prefixMessages = messages.slice(turnStartIndex, cut.index);
+  const summarizationClient = client as unknown as SummarizationClient;
+
+  try {
+    const { summary } = await summarizeTurnPrefix(summarizationClient, prefixMessages, env.openaiModel);
+    const turnSummaryMessage: ChatMessage = {
+      role: "system",
+      content: `Turn context checkpoint (earlier part of this turn was summarized):\n${summary}`,
+    };
+    return applyCompaction(messages, cut.index, turnSummaryMessage, keepPrefixCount);
+  } catch (err) {
+    console.error("[tool-loop] mid-loop split-turn compaction failed, continuing uncompacted", err);
+    return messages;
+  }
+}
+
 async function runLoopBody(
   history: Message[],
   onToken: (token: string) => void,
   onToolEvent: ((event: ToolEvent) => void) | undefined,
   tools: Tool[],
   client: ChatCompletionsClient,
-  maxIterations: number
+  maxIterations: number,
+  compaction: CompactionRuntimeOptions | undefined
 ): Promise<RunLoopResult> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
   const toolDefs = tools.map((t) => ({
@@ -260,11 +413,20 @@ async function runLoopBody(
     function: { name: t.name, description: t.description, parameters: t.parameters },
   }));
 
-  const recent = sliceHistoryAtTurnBoundaries(history, HISTORY_LIMIT);
-  const messages: ChatMessage[] = [
-    { role: "system", content: SYSTEM_PROMPT },
-    ...recent.map(rowToChatMessage),
-  ];
+  let messages: ChatMessage[];
+  if (compaction?.enabled) {
+    // Compaction owns the budget - the row-count window above is bypassed
+    // and the full history feeds the compaction pass instead.
+    messages = await buildCompactedMessages(history, client, compaction);
+  } else {
+    const recent = sliceHistoryAtTurnBoundaries(
+      history,
+      // TOOL_LOOP_HISTORY_LIMIT=0 disables the window: pass the full history
+      // (length as limit short-circuits the slice to a no-op). Default 20 rows.
+      env.toolLoopHistoryLimit > 0 ? env.toolLoopHistoryLimit : history.length
+    );
+    messages = [{ role: "system", content: SYSTEM_PROMPT }, ...recent.map(rowToChatMessage)];
+  }
 
   let lastAssistantText = "";
   const toolExchange: ToolExchangeRecord[] = [];
@@ -287,6 +449,10 @@ async function runLoopBody(
       : null;
 
   for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (compaction?.enabled) {
+      messages = await maybeSplitTurn(messages, client, compaction);
+    }
+
     const startMs = Date.now();
     const stream = await client.chat.completions.create({
       model: env.openaiModel,
@@ -434,7 +600,7 @@ export async function runToolLoop(
 
   try {
     return await Promise.race([
-      runLoopBody(history, onToken, onToolEvent, tools, client, maxIterations),
+      runLoopBody(history, onToken, onToolEvent, tools, client, maxIterations, options.compaction),
       timeout,
     ]);
   } finally {

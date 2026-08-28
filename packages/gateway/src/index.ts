@@ -13,6 +13,7 @@ import {
   getMessage,
   getReply,
   getConversationHistory,
+  getCompactionsForConversation,
   getMessagesByReplyTo,
   createRedisClient,
   createRedisSubscriber,
@@ -279,9 +280,20 @@ async function main() {
         pool,
         req.params.conversationId
       );
+      const compactions = await getCompactionsForConversation(
+        pool,
+        req.params.conversationId
+      );
       res.status(200).json({
         conversationId: conversation.id,
         messages: groupMessagesForClient(messages),
+        compactions: compactions.map((c) => ({
+          id: c.id,
+          summary: c.summary,
+          createdAt: c.created_at,
+          promptTokens: c.prompt_tokens,
+          completionTokens: c.completion_tokens,
+        })),
       });
     })
   );

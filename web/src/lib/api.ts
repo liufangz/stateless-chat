@@ -1,4 +1,4 @@
-import type { ConversationSummary, Message, ToolCallDetail } from '../types';
+import type { CompactionSummary, ConversationSummary, Message, ToolCallDetail } from '../types';
 
 const API_BASE = '/api';
 
@@ -80,7 +80,7 @@ export async function deleteConversation(conversationId: string, clientId: strin
 
 export function getHistory(
   conversationId: string,
-): Promise<{ conversationId: string; messages: Message[] }> {
+): Promise<{ conversationId: string; messages: Message[]; compactions: CompactionSummary[] }> {
   return jsonFetch(`/conversations/${conversationId}/messages`);
 }
 

@@ -1,4 +1,4 @@
-import type { Message } from '../types';
+import type { CompactionSummary, Message } from '../types';
 
 function formatCompactTokens(n: number): string {
   if (n >= 1000) {
@@ -8,7 +8,15 @@ function formatCompactTokens(n: number): string {
   return `${n} tok`;
 }
 
-export function StatsBar({ messages, sending }: { messages: Message[]; sending: boolean }) {
+export function StatsBar({
+  messages,
+  sending,
+  compactions = [],
+}: {
+  messages: Message[];
+  sending: boolean;
+  compactions?: CompactionSummary[];
+}) {
   let totalTokens = 0;
   let hasUsage = false;
   let sumCompletionTokens = 0;
@@ -22,6 +30,15 @@ export function StatsBar({ messages, sending }: { messages: Message[]; sending: 
       sumCompletionTokens += m.usage.completionTokens;
       sumDurationMs += m.usage.durationMs;
     }
+  }
+
+  // Summarization calls burn real tokens too - pi counts them in session
+  // totals, so a compacted conversation's reported usage doesn't silently
+  // undercount the LLM calls that ran on its behalf.
+  for (const c of compactions) {
+    if (c.promptTokens == null || c.completionTokens == null) continue;
+    hasUsage = true;
+    totalTokens += c.promptTokens + c.completionTokens;
   }
 
   const totalLabel = hasUsage ? formatCompactTokens(totalTokens) : null;

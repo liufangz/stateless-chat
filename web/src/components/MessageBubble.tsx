@@ -1,7 +1,7 @@
 import { memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import type { Message } from '../types';
+import type { Message, MessageStep, ToolCallSummary } from '../types';
 import { ToolCalls } from './ToolCalls';
 
 const MarkdownContent = memo(function MarkdownContent({ content }: { content: string }) {
@@ -61,33 +61,95 @@ const MarkdownContent = memo(function MarkdownContent({ content }: { content: st
   );
 });
 
+/**
+ * Groups consecutive steps of the same kind so tool chips from one LLM
+ * round-trip render as a single block, while text steps stay separate
+ * bubbles that appear "around" the tool calls in stream order.
+ */
+function groupSteps(steps: MessageStep[]): MessageStep[][] {
+  const groups: MessageStep[][] = [];
+  for (const step of steps) {
+    const last = groups[groups.length - 1];
+    if (last && last[0].type === step.type) {
+      last.push(step);
+    } else {
+      groups.push([step]);
+    }
+  }
+  return groups;
+}
+
 export function MessageBubble({ message, conversationId }: { message: Message; conversationId: string }) {
   const isUser = message.role === 'user';
-  const hasToolCalls = !isUser && !!message.tool_calls && message.tool_calls.length > 0;
+
+  if (isUser) {
+    return (
+      <div className="flex justify-end">
+        <div className="min-w-0 max-w-[95%] rounded-2xl rounded-br-sm bg-indigo-600 px-4 py-2.5 text-[15px] leading-relaxed break-words whitespace-pre-wrap text-white shadow-sm">
+          {message.content}
+        </div>
+      </div>
+    );
+  }
+
+  const replyToMessageId = message.reply_to_message_id ?? message.id;
+
+  // Live streaming replies carry an ordered list of text/tool steps, so the
+  // tool calls render in the middle of the turn (where they actually happen)
+  // instead of piling up above the final message.
+  if (message.steps && message.steps.length > 0) {
+    return (
+      <div className="flex justify-start">
+        <div className="flex max-w-[95%] min-w-0 flex-col items-start">
+          {groupSteps(message.steps).map((group, index) =>
+            group[0].type === 'tool' ? (
+              <ToolCalls
+                key={`tool-${group[0].id}`}
+                conversationId={conversationId}
+                toolCalls={group as ToolCallSummary[]}
+                replyToMessageId={replyToMessageId}
+              />
+            ) : (
+              <div
+                key={`text-${index}`}
+                className="mb-2 min-w-0 rounded-2xl rounded-bl-sm border border-slate-200 bg-white px-4 py-2.5 text-[15px] leading-relaxed break-words text-slate-800 shadow-sm last:mb-0"
+              >
+                {group[0].content && <MarkdownContent content={group[0].content} />}
+                {message.streaming && (
+                  <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-400 align-middle" />
+                )}
+                {message.streaming && message.liveSpeedTps != null && (
+                  <span className="ml-1.5 align-middle text-xs text-slate-400">
+                    {message.liveSpeedTps.toFixed(1)} tok/s
+                  </span>
+                )}
+              </div>
+            ),
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  const hasToolCalls = !!message.tool_calls && message.tool_calls.length > 0;
 
   return (
-    <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
-      <div className={`flex max-w-[95%] min-w-0 flex-col ${isUser ? 'items-end' : 'items-start'}`}>
+    <div className="flex justify-start">
+      <div className="flex max-w-[95%] min-w-0 flex-col items-start">
         {hasToolCalls && (
           <ToolCalls
             conversationId={conversationId}
             toolCalls={message.tool_calls!}
-            replyToMessageId={message.reply_to_message_id ?? message.id}
+            replyToMessageId={replyToMessageId}
           />
         )}
-        {(isUser || message.content || (message.streaming && !hasToolCalls)) && (
+        {(message.content || (message.streaming && !hasToolCalls)) && (
           <div
             className={`min-w-0 rounded-2xl px-4 py-2.5 text-[15px] leading-relaxed break-words shadow-sm ${
-              isUser
-                ? 'bg-indigo-600 text-white rounded-br-sm whitespace-pre-wrap'
-                : 'bg-white text-slate-800 border border-slate-200 rounded-bl-sm'
+              'bg-white text-slate-800 border border-slate-200 rounded-bl-sm'
             }`}
           >
-            {isUser ? (
-              message.content
-            ) : (
-              message.content && <MarkdownContent content={message.content} />
-            )}
+            {message.content && <MarkdownContent content={message.content} />}
             {message.streaming && (
               <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-400 align-middle" />
             )}

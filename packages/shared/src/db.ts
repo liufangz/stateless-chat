@@ -1,6 +1,7 @@
 import pg from "pg";
 import { env } from "./env.js";
 import type {
+  Compaction,
   Conversation,
   ConversationSummary,
   Message,
@@ -56,6 +57,22 @@ ALTER TABLE messages ADD CONSTRAINT messages_role_check CHECK (role IN ('user', 
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS completion_tokens INTEGER;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS duration_ms INTEGER;
+
+-- pi-style token-budgeted auto-compaction: one row per compaction pass, most
+-- recent first via the index below. first_kept_message_id is the id of the
+-- first 'user' row still sent to the LLM after this compaction - the next
+-- compaction's summarization span starts there, not at this row.
+CREATE TABLE IF NOT EXISTS compactions (
+  id TEXT PRIMARY KEY,
+  conversation_id UUID NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+  summary TEXT NOT NULL,
+  first_kept_message_id TEXT NOT NULL,
+  tokens_before INTEGER NOT NULL,
+  prompt_tokens INTEGER,
+  completion_tokens INTEGER,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS compactions_conversation_created ON compactions (conversation_id, created_at DESC);
 `;
 
 export async function initSchema(pool: pg.Pool): Promise<void> {
@@ -349,4 +366,67 @@ export async function insertToolExchange(
       );
     }
   }
+}
+
+export interface InsertCompactionInput {
+  id: string;
+  conversationId: string;
+  summary: string;
+  firstKeptMessageId: string;
+  tokensBefore: number;
+  promptTokens: number | null;
+  completionTokens: number | null;
+}
+
+export async function insertCompaction(
+  pool: pg.Pool,
+  input: InsertCompactionInput
+): Promise<Compaction> {
+  const { rows } = await pool.query<Compaction>(
+    `INSERT INTO compactions
+       (id, conversation_id, summary, first_kept_message_id, tokens_before, prompt_tokens, completion_tokens)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     RETURNING *`,
+    [
+      input.id,
+      input.conversationId,
+      input.summary,
+      input.firstKeptMessageId,
+      input.tokensBefore,
+      input.promptTokens,
+      input.completionTokens,
+    ]
+  );
+  return rows[0];
+}
+
+/**
+ * Most recent compaction for a conversation, or null if it has never been
+ * compacted. Used by the worker to chain summaries (previousSummary) and
+ * find the summarization span's start boundary on the next pass.
+ */
+export async function getLatestCompaction(
+  pool: pg.Pool,
+  conversationId: string
+): Promise<Compaction | null> {
+  const { rows } = await pool.query<Compaction>(
+    `SELECT * FROM compactions WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`,
+    [conversationId]
+  );
+  return rows[0] ?? null;
+}
+
+/**
+ * All compactions for a conversation, newest first - what the REST history
+ * endpoint surfaces as collapsible "context checkpoint" notes.
+ */
+export async function getCompactionsForConversation(
+  pool: pg.Pool,
+  conversationId: string
+): Promise<Compaction[]> {
+  const { rows } = await pool.query<Compaction>(
+    `SELECT * FROM compactions WHERE conversation_id = $1 ORDER BY created_at DESC`,
+    [conversationId]
+  );
+  return rows;
 }

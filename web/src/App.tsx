@@ -12,7 +12,7 @@ import {
 } from './lib/api';
 import { getOrCreateClientId, getSidebarCollapsed, getStoredConversationId, setSidebarCollapsed, setStoredConversationId } from './lib/storage';
 import { useMediaQuery } from './lib/useMediaQuery';
-import type { ConversationSummary, Message } from './types';
+import type { CompactionSummary, ConversationSummary, Message, MessageStep } from './types';
 import { MessageList } from './components/MessageList';
 import { StatsBar } from './components/StatsBar';
 import { Composer } from './components/Composer';
@@ -21,6 +21,19 @@ import { LoginScreen } from './components/LoginScreen';
 
 type InitState = 'loading' | 'ready' | 'error';
 type AuthState = 'checking' | 'authenticated' | 'unauthenticated';
+
+/**
+ * Appends a streamed text chunk to the in-progress step list, merging into
+ * the trailing text step (if any) so consecutive tokens stay in one bubble
+ * instead of creating a new message per token.
+ */
+function appendTextStep(steps: MessageStep[], chunk: string): MessageStep[] {
+  const last = steps[steps.length - 1];
+  if (last && last.type === 'text') {
+    return [...steps.slice(0, -1), { type: 'text', content: last.content + chunk }];
+  }
+  return [...steps, { type: 'text', content: chunk }];
+}
 
 function HamburgerIcon() {
   return (
@@ -43,6 +56,7 @@ export default function App() {
   const [authState, setAuthState] = useState<AuthState>('checking');
   const [conversationId, setConversationId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [compactions, setCompactions] = useState<CompactionSummary[]>([]);
   const [initState, setInitState] = useState<InitState>('loading');
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
@@ -112,6 +126,7 @@ export default function App() {
             if (cancelled) return;
             setConversationId(convId);
             setMessages(history.messages);
+            setCompactions(history.compactions);
             setInitState('ready');
             refreshConversations();
             return;
@@ -125,6 +140,7 @@ export default function App() {
         setStoredConversationId(created.conversationId);
         setConversationId(created.conversationId);
         setMessages([]);
+        setCompactions([]);
         setInitState('ready');
         refreshConversations();
       } catch (err) {
@@ -159,6 +175,7 @@ export default function App() {
     setInitState('loading');
     setConversationId(null);
     setMessages([]);
+    setCompactions([]);
     setConversations([]);
     setConversationsLoading(true);
     setErrorMessage(null);
@@ -172,6 +189,7 @@ export default function App() {
       setStoredConversationId(id);
       setConversationId(id);
       setMessages(history.messages);
+      setCompactions(history.compactions);
       setErrorMessage(null);
     } catch (err) {
       if (isUnauthorized(err)) {
@@ -190,6 +208,7 @@ export default function App() {
       setStoredConversationId(created.conversationId);
       setConversationId(created.conversationId);
       setMessages([]);
+      setCompactions([]);
       setErrorMessage(null);
       refreshConversations();
     } catch (err) {
@@ -225,6 +244,7 @@ export default function App() {
         setStoredConversationId(next.id);
         setConversationId(next.id);
         setMessages(history.messages);
+        setCompactions(history.compactions);
         setErrorMessage(null);
       } catch (err) {
         if (isUnauthorized(err)) {
@@ -241,6 +261,7 @@ export default function App() {
       setStoredConversationId(created.conversationId);
       setConversationId(created.conversationId);
       setMessages([]);
+      setCompactions([]);
       setErrorMessage(null);
       refreshConversations();
     } catch (err) {
@@ -267,6 +288,7 @@ export default function App() {
         role: 'assistant',
         content: '',
         streaming: true,
+        steps: [],
         reply_to_message_id: messageId,
       };
       setMessages((prev) => [...prev, userMessage, assistantMessage]);
@@ -294,26 +316,30 @@ export default function App() {
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
-                ? { ...m, content: m.content + chunk, ...(liveSpeedTps !== undefined ? { liveSpeedTps } : {}) }
+                ? {
+                    ...m,
+                    content: m.content + chunk,
+                    ...(liveSpeedTps !== undefined ? { liveSpeedTps } : {}),
+                    steps: appendTextStep(m.steps ?? [], chunk),
+                  }
                 : m,
             ),
           );
         },
         onToolStart: ({ toolCallId, toolName, args }) => {
+          const summary = {
+            id: toolCallId,
+            name: toolName,
+            arguments: args !== undefined ? JSON.stringify(args) : undefined,
+            running: true,
+          };
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
                 ? {
                     ...m,
-                    tool_calls: [
-                      ...(m.tool_calls ?? []),
-                      {
-                        id: toolCallId,
-                        name: toolName,
-                        arguments: args !== undefined ? JSON.stringify(args) : undefined,
-                        running: true,
-                      },
-                    ],
+                    tool_calls: [...(m.tool_calls ?? []), summary],
+                    steps: [...(m.steps ?? []), { type: 'tool', ...summary }],
                   }
                 : m,
             ),
@@ -327,6 +353,11 @@ export default function App() {
                     ...m,
                     tool_calls: (m.tool_calls ?? []).map((tc) =>
                       tc.id === toolCallId ? { ...tc, running: false, isError } : tc,
+                    ),
+                    steps: (m.steps ?? []).map((s) =>
+                      s.type === 'tool' && s.id === toolCallId
+                        ? { ...s, running: false, isError }
+                        : s,
                     ),
                   }
                 : m,
@@ -345,6 +376,7 @@ export default function App() {
           try {
             const history = await getHistory(activeConversationId);
             setMessages(history.messages);
+            setCompactions(history.compactions);
           } catch {
             // Best-effort refresh - the streamed content already rendered above.
           }
@@ -354,7 +386,18 @@ export default function App() {
           setMessages((prev) =>
             prev.map((m) =>
               m.id === assistantId
-                ? { ...m, content: m.content || `Error: ${message}`, streaming: false }
+                ? {
+                    ...m,
+                    content: m.content || `Error: ${message}`,
+                    streaming: false,
+                    // Surface the error even when steps-based rendering is
+                    // active (e.g. a mid-stream failure after some tool
+                    // steps already rendered).
+                    steps:
+                      m.steps && m.steps.length > 0
+                        ? [...m.steps, { type: 'text', content: `Error: ${message}` }]
+                        : m.steps,
+                  }
                 : m,
             ),
           );
@@ -428,11 +471,11 @@ export default function App() {
 
         {initState === 'ready' && conversationId && (
           <>
-            <MessageList messages={messages} conversationId={conversationId} />
+            <MessageList messages={messages} conversationId={conversationId} compactions={compactions} />
             {errorMessage && (
               <div className="px-4 py-1 text-center text-xs text-red-500">{errorMessage}</div>
             )}
-            <StatsBar messages={messages} sending={sending} />
+            <StatsBar messages={messages} sending={sending} compactions={compactions} />
             <Composer onSend={handleSend} disabled={sending} />
           </>
         )}

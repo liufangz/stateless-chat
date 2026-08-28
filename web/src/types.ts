@@ -23,6 +23,24 @@ export interface MessageUsage {
   durationMs: number | null;
 }
 
+/**
+ * Client-only ordered step of an in-progress assistant reply. The LLM can
+ * interleave text and tool calls within one turn (e.g. "let me check..." ->
+ * tool call -> final answer), so a live stream is rendered as a sequence of
+ * text/tool steps instead of flattening everything into one bubble.
+ */
+export type MessageStep =
+  | { type: 'text'; content: string }
+  | {
+      type: 'tool';
+      id: string;
+      name: string;
+      arguments?: string;
+      isError?: boolean;
+      /** True while this call's tool_end hasn't arrived yet. */
+      running?: boolean;
+    };
+
 export interface Message {
   id: string;
   role: Role;
@@ -35,6 +53,16 @@ export interface Message {
   speedTps?: number | null;
   /** Client-only: live tok/s while this message is still streaming. */
   liveSpeedTps?: number | null;
+  /** Client-only: ordered text/tool steps of an in-progress streaming reply. */
+  steps?: MessageStep[];
+}
+
+export interface CompactionSummary {
+  id: string;
+  summary: string;
+  createdAt: string;
+  promptTokens: number | null;
+  completionTokens: number | null;
 }
 
 export interface ConversationSummary {
