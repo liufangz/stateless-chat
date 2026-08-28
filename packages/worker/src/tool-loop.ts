@@ -19,18 +19,18 @@ export type { ToolExchangeRecord } from "@stateless-chat/shared";
 const SYSTEM_PROMPT =
   "You are a helpful, concise assistant in a chat application. Keep replies short. " +
   "Use the available tools when they would make your answer more accurate (e.g. exact " +
-  "date/time or arithmetic) instead of guessing.";
+  "date/time or arithmetic) instead of guessing. Answer the user's question directly: " +
+  "gather only what you need and then answer. Do not exhaustively survey the repository " +
+  "or read every file to answer a question — prefer a best-effort answer from available " +
+  "information.";
 
 export const HISTORY_LIMIT = 20;
-// Multi-file survey tasks (read_file pagination, bash exploration) routinely
-// need more than 6 LLM round-trips; 6 caused truncated/fallback answers on
-// "go through the project" style prompts (verified 2026-08-26). Raised to 12
-// with a matching timeout (DeepSeek round-trips ~3-8s each), then to 20 /
-// 300s on 2026-08-26 after a 12-iteration survey (conversation
-// a8fc3e11-ee93-44bd-b26f-a958840fef7f) still ended in the fallback message.
-// Raised to 50 / 600s on 2026-08-27 at liufangz's request (timeout must
-// scale with iterations: 50 x ~8s worst-case round-trips > 300s).
-const DEFAULT_MAX_ITERATIONS = 50;
+// pi has NO iteration cap on its tool loop (env.toolLoopMaxIterations, default
+// 200) - it's a cost fuse, not a behavior cap. Compaction owns context growth
+// (see maybeSplitTurn below); when the fuse trips or the wall-clock deadline
+// passes, the loop takes the answer-now retry path in runLoopBody, never a
+// direct fallback. Timeout history: 300s/20 iterations raised to 600s/50 on
+// 2026-08-27 at liufangz's request; now pi-style (see feat commit).
 const DEFAULT_TIMEOUT_MS = 600_000;
 const FALLBACK_MESSAGE =
   "I wasn't able to finish that using my tools — could you rephrase?";
@@ -405,6 +405,7 @@ async function runLoopBody(
   tools: Tool[],
   client: ChatCompletionsClient,
   maxIterations: number,
+  timeoutMs: number,
   compaction: CompactionRuntimeOptions | undefined
 ): Promise<RunLoopResult> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
@@ -448,7 +449,15 @@ async function runLoopBody(
         }
       : null;
 
+  const deadline = Date.now() + timeoutMs;
+  let exitReason: "fuse" | "deadline" = "fuse";
+
   for (let iteration = 0; iteration < maxIterations; iteration++) {
+    if (Date.now() > deadline) {
+      exitReason = "deadline";
+      break;
+    }
+
     if (compaction?.enabled) {
       messages = await maybeSplitTurn(messages, client, compaction);
     }
@@ -574,9 +583,62 @@ async function runLoopBody(
   }
 
   console.warn(
-    `[tool-loop] hit max iterations (${maxIterations}) without a final answer - ` +
-      `returning ${lastAssistantText ? "the last partial answer" : "the fallback message"}`
+    exitReason === "deadline"
+      ? `[tool-loop] hit wall-clock deadline (${timeoutMs}ms) without a final answer - issuing an answer-now retry`
+      : `[tool-loop] hit max iterations (${maxIterations}) without a final answer - issuing an answer-now retry`
   );
+
+  // pi's compact-and-retry analog: one final call, no tools, telling the
+  // model to answer from whatever was gathered instead of continuing to
+  // reach for more tools it no longer has budget for.
+  try {
+    const retryMessages: ChatMessage[] = [
+      ...messages,
+      {
+        role: "user",
+        content:
+          "Tool budget exhausted. Answer the user's original question now, using only the " +
+          "information gathered above. Do not call any tools.",
+      },
+    ];
+
+    const retryStartMs = Date.now();
+    const retryStream = await client.chat.completions.create({
+      model: env.openaiModel,
+      messages: retryMessages,
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+
+    let retryText = "";
+    let retryFirstTokenMs: number | null = null;
+    for await (const chunk of retryStream) {
+      if (chunk.usage) {
+        usageSeen = true;
+        totalPromptTokens += chunk.usage.prompt_tokens ?? 0;
+        totalCompletionTokens += chunk.usage.completion_tokens ?? 0;
+      }
+      const choice = chunk.choices?.[0];
+      if (!choice) continue;
+      const delta = choice.delta ?? {};
+      if (delta.content) {
+        if (retryFirstTokenMs === null) retryFirstTokenMs = Date.now();
+        retryText += delta.content;
+        onToken(delta.content);
+      }
+    }
+    const retryEndMs = Date.now();
+    totalStreamMs += retryEndMs - retryStartMs;
+    if (retryFirstTokenMs !== null) totalFirstTokenMs += retryFirstTokenMs - retryStartMs;
+
+    if (retryText) {
+      return { content: retryText, toolExchange, usage: buildUsage() };
+    }
+    console.warn("[tool-loop] answer-now retry returned no text - falling back");
+  } catch (err) {
+    console.warn("[tool-loop] answer-now retry failed - falling back", err);
+  }
+
   return { content: lastAssistantText || FALLBACK_MESSAGE, toolExchange, usage: buildUsage() };
 }
 
@@ -586,21 +648,27 @@ export async function runToolLoop(
   onToolEvent?: (event: ToolEvent) => void,
   options: ToolLoopOptions = {}
 ): Promise<RunLoopResult> {
-  const maxIterations = options.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+  const maxIterations = options.maxIterations ?? env.toolLoopMaxIterations;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const tools = options.tools ?? DEFAULT_TOOLS;
   const client = options.client ?? getDefaultClient();
 
+  // Pure backstop, not the primary exit path anymore: the loop itself exits
+  // gracefully at `timeoutMs` (checked per-iteration in runLoopBody) and
+  // runs the answer-now retry, which needs its own headroom to complete.
+  // This only fires for a truly stuck call (e.g. a hung tool execution)
+  // that the per-iteration deadline check can't preempt mid-await.
+  const backstopMs = timeoutMs + 120_000;
   let timeoutHandle: NodeJS.Timeout;
   const timeout = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(() => {
-      reject(new Error(`Tool loop timed out after ${timeoutMs}ms`));
-    }, timeoutMs);
+      reject(new Error(`Tool loop timed out after ${backstopMs}ms`));
+    }, backstopMs);
   });
 
   try {
     return await Promise.race([
-      runLoopBody(history, onToken, onToolEvent, tools, client, maxIterations, options.compaction),
+      runLoopBody(history, onToken, onToolEvent, tools, client, maxIterations, timeoutMs, options.compaction),
       timeout,
     ]);
   } finally {

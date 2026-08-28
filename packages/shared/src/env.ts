@@ -47,6 +47,12 @@ export const env = {
   // fast, so unlimited risks DeepSeek 400 / overflow on long chats. Ignored
   // when compactionEnabled is true - compaction owns the budget instead.
   toolLoopHistoryLimit: Number(process.env.TOOL_LOOP_HISTORY_LIMIT ?? 20),
+  // pi has NO iteration cap on its tool loop. This is a cost fuse, not a
+  // behavior cap: compaction (below) owns context growth, so the fuse only
+  // exists so a pathological loop that never stops calling tools can't run
+  // forever. When it trips, tool-loop.ts takes the answer-now retry path,
+  // not a hard failure.
+  toolLoopMaxIterations: Number(process.env.TOOL_LOOP_MAX_ITERATIONS ?? 200),
   // pi-style token-budgeted auto-compaction: summarizes old conversation
   // turns with the LLM instead of hard-slicing rows. Master switch - when
   // false, tool-loop falls back to the row-slice behavior above unchanged.

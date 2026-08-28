@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Message } from "@stateless-chat/shared";
+import { env } from "@stateless-chat/shared";
 import {
   runToolLoop,
   DEFAULT_TOOLS,
@@ -16,7 +17,12 @@ type StreamStep =
   | { kind: "text"; content: string }
   | { kind: "tool_call"; index: number; id?: string; name?: string; argsFragment?: string }
   | { kind: "finish"; reason: "tool_calls" | "stop" | "length" }
-  | { kind: "usage"; usage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } };
+  | { kind: "usage"; usage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } }
+  | { kind: "delay"; ms: number };
+
+function delay(ms: number): StreamStep {
+  return { kind: "delay", ms };
+}
 
 function text(content: string): StreamStep {
   return { kind: "text", content };
@@ -44,6 +50,8 @@ function usageChunk(usage: {
 
 function chunkFromStep(step: StreamStep) {
   switch (step.kind) {
+    case "delay":
+      throw new Error("delay steps must be handled by makeStream, not chunked");
     case "finish":
       return { choices: [{ delta: {}, finish_reason: step.reason }] };
     case "usage":
@@ -68,6 +76,10 @@ function chunkFromStep(step: StreamStep) {
 
 async function* makeStream(steps: StreamStep[]) {
   for (const step of steps) {
+    if (step.kind === "delay") {
+      await new Promise((resolve) => setTimeout(resolve, step.ms));
+      continue;
+    }
     yield chunkFromStep(step);
   }
 }
@@ -150,22 +162,59 @@ describe("runToolLoop", () => {
     expect(toolMsg.content).toMatch(/error/i);
   });
 
-  it("b) model keeps emitting tool_calls forever: stops at maxIterations and returns fallback", async () => {
+  it("b) model keeps emitting tool_calls forever: stops at maxIterations and answers via answer-now retry", async () => {
     const echo = makeTool("echo", () => "ok");
-    const { client, create } = createFakeClient([
-      [toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")],
+    const toolOnly = () => [toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")];
+    const { client, create, calls } = createFakeClient([
+      toolOnly(),
+      toolOnly(),
+      toolOnly(),
+      [text("Retry answer"), finish("stop")],
     ]);
+    const tokens: string[] = [];
+    const onToken = vi.fn((t: string) => tokens.push(t));
 
-    const { content, toolExchange } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+    const { content, toolExchange } = await runToolLoop(makeHistory(), onToken, undefined, {
       client: client as any,
       tools: [echo] as any,
       maxIterations: 3,
     });
 
-    expect(create).toHaveBeenCalledTimes(3);
-    expect(content).toBe(FALLBACK);
+    // 3 fuse iterations + 1 answer-now retry call.
+    expect(create).toHaveBeenCalledTimes(4);
+    expect(content).toBe("Retry answer");
+    expect(tokens.join("")).toBe("Retry answer");
     expect(toolExchange).toHaveLength(3);
     expect(toolExchange.every((r) => r.toolCallId === "call_x" && !r.isError)).toBe(true);
+
+    const retryCall = calls[3];
+    expect(retryCall.tools).toBeUndefined();
+    const lastMessage = retryCall.messages[retryCall.messages.length - 1];
+    expect(lastMessage).toMatchObject({ role: "user" });
+    expect(lastMessage.content).toMatch(/tool budget exhausted/i);
+    expect(lastMessage.content).toMatch(/do not call any tools/i);
+  });
+
+  it("b2) answer-now retry itself fails: falls back to the fallback message", async () => {
+    const echo = makeTool("echo", () => "ok");
+    let calls = 0;
+    const create = vi.fn().mockImplementation(async () => {
+      calls++;
+      if (calls <= 3) {
+        return makeStream([toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")]);
+      }
+      throw new Error("retry network fail");
+    });
+    const client = { chat: { completions: { create } } };
+
+    const { content } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+      client: client as any,
+      tools: [echo] as any,
+      maxIterations: 3,
+    });
+
+    expect(create).toHaveBeenCalledTimes(4);
+    expect(content).toBe(FALLBACK);
   });
 
   it("c) tool execute() throws: error fed back, loop continues to a final answer", async () => {
@@ -322,18 +371,31 @@ describe("runToolLoop", () => {
     expect(toolExchange[1].result).toMatch(/error/i);
   });
 
-  it("i) wall-clock timeout: a hung tool causes runToolLoop to reject", async () => {
-    const hang = makeTool("hang", () => new Promise<string>(() => {}));
-    const { client } = createFakeClient([[toolCallStart(0, "call_1", "hang", "{}"), finish("tool_calls")]]);
+  it("i) wall-clock deadline: loop exits gracefully mid-survey and answers via answer-now retry (no rejection)", async () => {
+    const echo = makeTool("echo", () => "ok");
+    const { client, create } = createFakeClient([
+      // Iteration 0 runs (deadline not yet passed), but takes long enough
+      // that the top-of-iteration check on iteration 1 sees the deadline
+      // has passed, and breaks before making another tool-only call.
+      [delay(30), toolCallStart(0, "call_1", "echo", "{}"), finish("tool_calls")],
+      [text("Answer from retry"), finish("stop")],
+    ]);
+    const tokens: string[] = [];
+    const onToken = vi.fn((t: string) => tokens.push(t));
 
-    await expect(
-      runToolLoop(makeHistory(), vi.fn(), undefined, {
-        client: client as any,
-        tools: [hang] as any,
-        timeoutMs: 100,
-      })
-    ).rejects.toThrow();
-  }, 5000);
+    const { content } = await runToolLoop(makeHistory(), onToken, undefined, {
+      client: client as any,
+      tools: [echo] as any,
+      maxIterations: 50,
+      timeoutMs: 10,
+    });
+
+    // Exactly one tool-only iteration, then the answer-now retry - never a
+    // second tool-only round, and never a rejection.
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(content).toBe("Answer from retry");
+    expect(tokens.join("")).toBe("Answer from retry");
+  });
 
   it("j) final answer contains only final text; resolved string equals what onToken received", async () => {
     const echo = makeTool("echo", () => "ok");
@@ -446,6 +508,15 @@ describe("runToolLoop", () => {
 
     expect(content).toBe("Hi");
     expect(usage).toBeNull();
+  });
+});
+
+describe("tool loop max iterations", () => {
+  it("defaults to 200, or honors TOOL_LOOP_MAX_ITERATIONS when set in the environment", () => {
+    const expected = process.env.TOOL_LOOP_MAX_ITERATIONS
+      ? Number(process.env.TOOL_LOOP_MAX_ITERATIONS)
+      : 200;
+    expect(env.toolLoopMaxIterations).toBe(expected);
   });
 });
 
