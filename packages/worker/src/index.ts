@@ -31,7 +31,7 @@ async function processMessage(message: Message) {
 
   try {
     const history = await getConversationHistory(pool, message.conversation_id);
-    const { content, toolExchange } = await runToolLoop(
+    const { content, toolExchange, usage } = await runToolLoop(
       history,
       (token) => {
         publisher
@@ -49,16 +49,42 @@ async function processMessage(message: Message) {
       await insertToolExchange(pool, message.conversation_id, message.id, toolExchange);
     }
 
+    const durationMs = usage?.streamMs ?? null;
+    const speedTps =
+      usage && usage.streamMs > 0
+        ? Math.round((usage.completionTokens / (usage.streamMs / 1000)) * 10) / 10
+        : null;
+
     await insertAssistantMessage(
       pool,
       message.conversation_id,
       message.id,
-      content
+      content,
+      usage
+        ? {
+            promptTokens: usage.promptTokens,
+            completionTokens: usage.completionTokens,
+            durationMs,
+          }
+        : null
     );
     await markMessageStatus(pool, message.id, "done");
     await publisher.publish(
       channel,
-      JSON.stringify({ type: "done", messageId: message.id, content })
+      JSON.stringify({
+        type: "done",
+        messageId: message.id,
+        content,
+        usage: usage
+          ? {
+              promptTokens: usage.promptTokens,
+              completionTokens: usage.completionTokens,
+              totalTokens: usage.totalTokens,
+            }
+          : null,
+        speedTps,
+        durationMs,
+      })
     );
     log("done");
   } catch (err) {

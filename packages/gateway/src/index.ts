@@ -407,7 +407,12 @@ async function main() {
             isError: event.isError,
           });
         } else if (event.type === "done") {
-          send("done", { content: event.content });
+          send("done", {
+            content: event.content,
+            usage: event.usage,
+            speedTps: event.speedTps,
+            durationMs: event.durationMs,
+          });
           res.end();
           cleanup();
         } else if (event.type === "error") {
@@ -421,8 +426,24 @@ async function main() {
       if (existingReply) {
         // Already finished (e.g. client reconnected after the fact) - reply
         // straight from Postgres and ignore anything buffered from Redis.
+        const hasUsage = existingReply.prompt_tokens != null && existingReply.completion_tokens != null;
+        const durationMs = existingReply.duration_ms ?? null;
         send("token", { content: existingReply.content });
-        send("done", { content: existingReply.content });
+        send("done", {
+          content: existingReply.content,
+          usage: hasUsage
+            ? {
+                promptTokens: existingReply.prompt_tokens,
+                completionTokens: existingReply.completion_tokens,
+                totalTokens: (existingReply.prompt_tokens ?? 0) + (existingReply.completion_tokens ?? 0),
+              }
+            : null,
+          speedTps:
+            hasUsage && durationMs && durationMs > 0
+              ? Math.round((existingReply.completion_tokens! / (durationMs / 1000)) * 10) / 10
+              : null,
+          durationMs,
+        });
         res.end();
         cleanup();
         return;

@@ -91,6 +91,11 @@ export function MessageBubble({ message, conversationId }: { message: Message; c
             {message.streaming && (
               <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse bg-slate-400 align-middle" />
             )}
+            {message.streaming && message.liveSpeedTps != null && (
+              <span className="ml-1.5 align-middle text-xs text-slate-400">
+                {message.liveSpeedTps.toFixed(1)} tok/s
+              </span>
+            )}
           </div>
         )}
       </div>

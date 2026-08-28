@@ -15,7 +15,8 @@ import {
 type StreamStep =
   | { kind: "text"; content: string }
   | { kind: "tool_call"; index: number; id?: string; name?: string; argsFragment?: string }
-  | { kind: "finish"; reason: "tool_calls" | "stop" | "length" };
+  | { kind: "finish"; reason: "tool_calls" | "stop" | "length" }
+  | { kind: "usage"; usage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } };
 
 function text(content: string): StreamStep {
   return { kind: "text", content };
@@ -33,10 +34,22 @@ function finish(reason: "tool_calls" | "stop" | "length"): StreamStep {
   return { kind: "finish", reason };
 }
 
+function usageChunk(usage: {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens?: number;
+}): StreamStep {
+  return { kind: "usage", usage };
+}
+
 function chunkFromStep(step: StreamStep) {
   switch (step.kind) {
     case "finish":
       return { choices: [{ delta: {}, finish_reason: step.reason }] };
+    case "usage":
+      // Mirrors DeepSeek's real behavior: usage arrives on a trailing chunk
+      // with an EMPTY choices array, not attached to the finish chunk.
+      return { choices: [], usage: step.usage };
     case "text":
       return { choices: [{ delta: { content: step.content }, finish_reason: null }] };
     case "tool_call": {
@@ -371,6 +384,68 @@ describe("runToolLoop", () => {
         result: expect.stringMatching(/truncated/i),
       }),
     ]);
+  });
+
+  it("l) usage chunk (empty choices) is accumulated, not skipped by the choices?.[0] continue-check", async () => {
+    const { client } = createFakeClient([
+      [
+        text("Answer"),
+        finish("stop"),
+        usageChunk({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 }),
+      ],
+    ]);
+
+    const { content, usage } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+      client: client as any,
+    });
+
+    expect(content).toBe("Answer");
+    expect(usage).not.toBeNull();
+    expect(usage).toMatchObject({
+      promptTokens: 10,
+      completionTokens: 5,
+      totalTokens: 15,
+    });
+    expect(usage!.streamMs).toBeGreaterThanOrEqual(0);
+    expect(usage!.firstTokenMs).toBeGreaterThanOrEqual(0);
+  });
+
+  it("m) usage accumulates across multiple tool-loop iterations", async () => {
+    const echo = makeTool("echo", () => "ok");
+    const { client } = createFakeClient([
+      [
+        toolCallStart(0, "call_1", "echo", "{}"),
+        finish("tool_calls"),
+        usageChunk({ prompt_tokens: 20, completion_tokens: 3 }),
+      ],
+      [
+        text("done"),
+        finish("stop"),
+        usageChunk({ prompt_tokens: 30, completion_tokens: 7 }),
+      ],
+    ]);
+
+    const { usage } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+      client: client as any,
+      tools: [echo] as any,
+    });
+
+    expect(usage).toMatchObject({
+      promptTokens: 50,
+      completionTokens: 10,
+      totalTokens: 60,
+    });
+  });
+
+  it("n) no usage chunk delivered: usage is null, not zeroed", async () => {
+    const { client } = createFakeClient([[text("Hi"), finish("stop")]]);
+
+    const { content, usage } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+      client: client as any,
+    });
+
+    expect(content).toBe("Hi");
+    expect(usage).toBeNull();
   });
 });
 

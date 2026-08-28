@@ -50,6 +50,12 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS tool_is_error BOOLEAN;
 -- both statements no-op (IF EXISTS) or replace on every schema init.
 ALTER TABLE messages DROP CONSTRAINT IF EXISTS messages_role_check;
 ALTER TABLE messages ADD CONSTRAINT messages_role_check CHECK (role IN ('user', 'assistant', 'tool'));
+
+-- Token usage + stream timing: nullable, additive - set only on a turn's
+-- final text assistant row (tool-call/tool rows and legacy rows stay NULL).
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS completion_tokens INTEGER;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS duration_ms INTEGER;
 `;
 
 export async function initSchema(pool: pg.Pool): Promise<void> {
@@ -260,17 +266,32 @@ export async function deleteConversation(
   }
 }
 
+export interface AssistantMessageUsage {
+  promptTokens: number | null;
+  completionTokens: number | null;
+  durationMs: number | null;
+}
+
 export async function insertAssistantMessage(
   pool: pg.Pool,
   conversationId: string,
   replyToMessageId: string,
-  content: string
+  content: string,
+  usage: AssistantMessageUsage | null = null
 ): Promise<Message> {
   const { rows } = await pool.query<Message>(
-    `INSERT INTO messages (conversation_id, role, content, status, reply_to_message_id)
-     VALUES ($1, 'assistant', $2, 'done', $3)
+    `INSERT INTO messages
+       (conversation_id, role, content, status, reply_to_message_id, prompt_tokens, completion_tokens, duration_ms)
+     VALUES ($1, 'assistant', $2, 'done', $3, $4, $5, $6)
      RETURNING *`,
-    [conversationId, content, replyToMessageId]
+    [
+      conversationId,
+      content,
+      replyToMessageId,
+      usage?.promptTokens ?? null,
+      usage?.completionTokens ?? null,
+      usage?.durationMs ?? null,
+    ]
   );
   return rows[0];
 }

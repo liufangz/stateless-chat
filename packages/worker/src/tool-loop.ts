@@ -42,8 +42,15 @@ export interface ChatCompletionChunkChoice {
   finish_reason?: string | null;
 }
 
+export interface ChatCompletionChunkUsage {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  total_tokens?: number;
+}
+
 export interface ChatCompletionChunkLike {
   choices: ChatCompletionChunkChoice[];
+  usage?: ChatCompletionChunkUsage | null;
 }
 
 export interface ChatMessage {
@@ -69,6 +76,7 @@ export interface ChatCompletionsClient {
         }>;
         tool_choice?: "auto";
         stream: true;
+        stream_options?: { include_usage: boolean };
       }): Promise<AsyncIterable<ChatCompletionChunkLike>>;
     };
   };
@@ -224,9 +232,18 @@ export function rowToChatMessage(m: Message): ChatMessage {
   return { role: m.role as "user" | "assistant", content: m.content };
 }
 
+export interface RunLoopUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  streamMs: number;
+  firstTokenMs: number;
+}
+
 export interface RunLoopResult {
   content: string;
   toolExchange: ToolExchangeRecord[];
+  usage: RunLoopUsage | null;
 }
 
 async function runLoopBody(
@@ -252,13 +269,32 @@ async function runLoopBody(
   let lastAssistantText = "";
   const toolExchange: ToolExchangeRecord[] = [];
 
+  let usageSeen = false;
+  let totalPromptTokens = 0;
+  let totalCompletionTokens = 0;
+  let totalStreamMs = 0;
+  let totalFirstTokenMs = 0;
+
+  const buildUsage = (): RunLoopUsage | null =>
+    usageSeen
+      ? {
+          promptTokens: totalPromptTokens,
+          completionTokens: totalCompletionTokens,
+          totalTokens: totalPromptTokens + totalCompletionTokens,
+          streamMs: totalStreamMs,
+          firstTokenMs: totalFirstTokenMs,
+        }
+      : null;
+
   for (let iteration = 0; iteration < maxIterations; iteration++) {
+    const startMs = Date.now();
     const stream = await client.chat.completions.create({
       model: env.openaiModel,
       messages,
       tools: toolDefs,
       tool_choice: "auto",
       stream: true,
+      stream_options: { include_usage: true },
     });
 
     let text = "";
@@ -266,12 +302,24 @@ async function runLoopBody(
     // not appended in order - accumulate by index, not by arrival order.
     const toolCallsByIndex = new Map<number, AccumulatedToolCall>();
     let finishReason: string | null = null;
+    let firstTokenMs: number | null = null;
 
     for await (const chunk of stream) {
+      // Usage may arrive on a chunk with empty `choices` (e.g. the final
+      // usage-only chunk DeepSeek sends with stream_options.include_usage) -
+      // read it before the choices?.[0] continue-check below, or it's
+      // silently dropped.
+      if (chunk.usage) {
+        usageSeen = true;
+        totalPromptTokens += chunk.usage.prompt_tokens ?? 0;
+        totalCompletionTokens += chunk.usage.completion_tokens ?? 0;
+      }
+
       const choice = chunk.choices?.[0];
       if (!choice) continue;
       const delta = choice.delta ?? {};
       if (delta.content) {
+        if (firstTokenMs === null) firstTokenMs = Date.now();
         text += delta.content;
         onToken(delta.content);
       }
@@ -291,12 +339,16 @@ async function runLoopBody(
       if (choice.finish_reason) finishReason = choice.finish_reason;
     }
 
+    const endMs = Date.now();
+    totalStreamMs += endMs - startMs;
+    if (firstTokenMs !== null) totalFirstTokenMs += firstTokenMs - startMs;
+
     const toolCalls = Array.from(toolCallsByIndex.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([, v]) => v);
 
     if (toolCalls.length === 0) {
-      return { content: text, toolExchange };
+      return { content: text, toolExchange, usage: buildUsage() };
     }
     if (text) lastAssistantText = text;
 
@@ -359,7 +411,7 @@ async function runLoopBody(
     `[tool-loop] hit max iterations (${maxIterations}) without a final answer - ` +
       `returning ${lastAssistantText ? "the last partial answer" : "the fallback message"}`
   );
-  return { content: lastAssistantText || FALLBACK_MESSAGE, toolExchange };
+  return { content: lastAssistantText || FALLBACK_MESSAGE, toolExchange, usage: buildUsage() };
 }
 
 export async function runToolLoop(

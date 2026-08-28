@@ -17,6 +17,12 @@ export interface ToolCallDetail {
   isError: boolean;
 }
 
+export interface MessageUsage {
+  promptTokens: number;
+  completionTokens: number;
+  durationMs: number | null;
+}
+
 export interface Message {
   id: string;
   role: Role;
@@ -25,6 +31,10 @@ export interface Message {
   streaming?: boolean;
   tool_calls?: ToolCallSummary[];
   reply_to_message_id?: string | null;
+  usage?: MessageUsage | null;
+  speedTps?: number | null;
+  /** Client-only: live tok/s while this message is still streaming. */
+  liveSpeedTps?: number | null;
 }
 
 export interface ConversationSummary {

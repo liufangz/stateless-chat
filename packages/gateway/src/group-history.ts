@@ -7,9 +7,37 @@ export interface ClientToolCallSummary {
   isError: boolean;
 }
 
-export type ClientMessage = Omit<Message, "tool_calls" | "tool_call_id" | "tool_name" | "tool_is_error"> & {
+export interface ClientMessageUsage {
+  promptTokens: number;
+  completionTokens: number;
+  durationMs: number | null;
+}
+
+export type ClientMessage = Omit<
+  Message,
+  "tool_calls" | "tool_call_id" | "tool_name" | "tool_is_error" | "prompt_tokens" | "completion_tokens" | "duration_ms"
+> & {
   tool_calls?: ClientToolCallSummary[] | null;
+  usage?: ClientMessageUsage | null;
+  speedTps?: number | null;
 };
+
+function usageFromRow(row: Message): { usage: ClientMessageUsage | null; speedTps: number | null } {
+  if (row.prompt_tokens == null || row.completion_tokens == null) {
+    return { usage: null, speedTps: null };
+  }
+  const durationMs = row.duration_ms ?? null;
+  const usage: ClientMessageUsage = {
+    promptTokens: row.prompt_tokens,
+    completionTokens: row.completion_tokens,
+    durationMs,
+  };
+  const speedTps =
+    durationMs && durationMs > 0
+      ? Math.round((row.completion_tokens / (durationMs / 1000)) * 10) / 10
+      : null;
+  return { usage, speedTps };
+}
 
 /**
  * Turns raw `messages` rows into what the frontend renders: standalone
@@ -32,7 +60,7 @@ export function groupMessagesForClient(rows: Message[]): ClientMessage[] {
     if (row.role === "tool") continue;
 
     if (row.role === "assistant" && row.tool_calls && row.tool_calls.length > 0) {
-      const { tool_calls, tool_call_id, tool_name, tool_is_error, ...rest } = row;
+      const { tool_calls, tool_call_id, tool_name, tool_is_error, prompt_tokens, completion_tokens, duration_ms, ...rest } = row;
       result.push({
         ...rest,
         tool_calls: tool_calls.map((tc) => ({
@@ -43,8 +71,9 @@ export function groupMessagesForClient(rows: Message[]): ClientMessage[] {
         })),
       });
     } else {
-      const { tool_calls: _toolCalls, ...rest } = row;
-      result.push(rest);
+      const { tool_calls: _toolCalls, prompt_tokens, completion_tokens, duration_ms, ...rest } = row;
+      const { usage, speedTps } = usageFromRow(row);
+      result.push({ ...rest, usage, speedTps });
     }
   }
   return result;

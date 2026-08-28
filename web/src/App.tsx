@@ -14,6 +14,7 @@ import { getOrCreateClientId, getSidebarCollapsed, getStoredConversationId, setS
 import { useMediaQuery } from './lib/useMediaQuery';
 import type { ConversationSummary, Message } from './types';
 import { MessageList } from './components/MessageList';
+import { StatsBar } from './components/StatsBar';
 import { Composer } from './components/Composer';
 import { Sidebar } from './components/Sidebar';
 import { LoginScreen } from './components/LoginScreen';
@@ -273,10 +274,29 @@ export default function App() {
 
       const activeConversationId = conversationId;
 
+      // Live tok/s estimate: tokens received / seconds since the first
+      // token. Throttled to ~300ms so re-renders don't churn on every token.
+      let tokenCount = 0;
+      let firstTokenAt = 0;
+      let lastSpeedRenderAt = 0;
+
       streamReply(streamUrl, {
         onToken: (chunk) => {
+          const now = Date.now();
+          tokenCount += 1;
+          if (!firstTokenAt) firstTokenAt = now;
+          let liveSpeedTps: number | undefined;
+          if (now - lastSpeedRenderAt >= 300) {
+            lastSpeedRenderAt = now;
+            const elapsedSec = (now - firstTokenAt) / 1000;
+            if (elapsedSec > 0) liveSpeedTps = Math.round((tokenCount / elapsedSec) * 10) / 10;
+          }
           setMessages((prev) =>
-            prev.map((m) => (m.id === assistantId ? { ...m, content: m.content + chunk } : m)),
+            prev.map((m) =>
+              m.id === assistantId
+                ? { ...m, content: m.content + chunk, ...(liveSpeedTps !== undefined ? { liveSpeedTps } : {}) }
+                : m,
+            ),
           );
         },
         onToolStart: ({ toolCallId, toolName, args }) => {
@@ -313,8 +333,15 @@ export default function App() {
             ),
           );
         },
-        onDone: async () => {
+        onDone: async (_fullContent, { speedTps }) => {
           setSending(false);
+          // Show the exact speed immediately, before the history refetch
+          // below (which carries the canonical per-message usage) resolves.
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, streaming: false, liveSpeedTps: null, speedTps } : m,
+            ),
+          );
           try {
             const history = await getHistory(activeConversationId);
             setMessages(history.messages);
@@ -405,6 +432,7 @@ export default function App() {
             {errorMessage && (
               <div className="px-4 py-1 text-center text-xs text-red-500">{errorMessage}</div>
             )}
+            <StatsBar messages={messages} sending={sending} />
             <Composer onSend={handleSend} disabled={sending} />
           </>
         )}

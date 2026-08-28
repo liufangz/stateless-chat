@@ -93,9 +93,15 @@ export function fetchToolCalls(
   ).then((body) => body.toolCalls);
 }
 
+export interface DoneUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
 export interface StreamHandlers {
   onToken: (chunk: string) => void;
-  onDone: (fullContent: string) => void;
+  onDone: (fullContent: string, meta: { usage: DoneUsage | null; speedTps: number | null; durationMs: number | null }) => void;
   onError: (message: string) => void;
   onToolStart?: (info: { toolCallId: string; toolName: string; args?: unknown }) => void;
   onToolEnd?: (info: { toolCallId: string; toolName: string; isError: boolean }) => void;
@@ -120,8 +126,8 @@ export function streamReply(streamUrl: string, handlers: StreamHandlers): () => 
   });
 
   source.addEventListener('done', (event) => {
-    const { content } = JSON.parse((event as MessageEvent).data);
-    handlers.onDone(content);
+    const { content, usage, speedTps, durationMs } = JSON.parse((event as MessageEvent).data);
+    handlers.onDone(content, { usage: usage ?? null, speedTps: speedTps ?? null, durationMs: durationMs ?? null });
     source.close();
   });
 

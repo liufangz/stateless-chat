@@ -37,6 +37,11 @@ export interface Message {
   tool_call_id?: string | null;
   tool_name?: string | null;
   tool_is_error?: boolean | null;
+  // Token usage + timing (Phase: usage stats) - set only on a turn's final
+  // text assistant row; NULL on tool-call/tool rows and legacy rows.
+  prompt_tokens?: number | null;
+  completion_tokens?: number | null;
+  duration_ms?: number | null;
 }
 
 // One executed tool call produced by the worker's tool loop, in execution
@@ -60,9 +65,24 @@ export interface NewMessageNotification {
   conversationId: string;
 }
 
+export interface UsageStats {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  streamMs: number;
+  firstTokenMs: number;
+}
+
 export type StreamEvent =
   | { type: "token"; content: string }
-  | { type: "done"; messageId: string; content: string }
+  | {
+      type: "done";
+      messageId: string;
+      content: string;
+      usage: Pick<UsageStats, "promptTokens" | "completionTokens" | "totalTokens"> | null;
+      speedTps: number | null;
+      durationMs: number | null;
+    }
   | { type: "error"; message: string }
   | { type: "tool_start"; toolCallId: string; toolName: string; args?: unknown }
   | { type: "tool_end"; toolCallId: string; toolName: string; isError: boolean };
