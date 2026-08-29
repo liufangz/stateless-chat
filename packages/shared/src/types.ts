@@ -37,17 +37,35 @@ export interface Message {
   tool_call_id?: string | null;
   tool_name?: string | null;
   tool_is_error?: boolean | null;
+  // Phase 3 reliability: which tool-loop round produced this row. Set only
+  // on assistant tool-call-request rows (tool_calls non-empty) - this is
+  // what lets a resumed turn know the next free iteration number, and lets
+  // the DB enforce "at most one request row per (turn, iteration)".
+  iteration?: number | null;
   // Token usage + timing (Phase: usage stats) - set only on a turn's final
   // text assistant row; NULL on tool-call/tool rows and legacy rows.
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
   duration_ms?: number | null;
+  // Processing ownership/lease (Phase 1 reliability) - only meaningful on
+  // role='user' rows, which are the claimable "job" rows. worker_id +
+  // lease_expires_at identify who currently owns a 'processing' row and
+  // when that claim expires if not renewed; attempt_count counts every
+  // claim (fresh or reclaimed after an expired lease); last_error carries
+  // the most recent failure reason for a 'failed' row so it stays
+  // diagnosable after reload instead of only existing as a transient SSE
+  // event.
+  worker_id?: string | null;
+  lease_expires_at?: string | null;
+  attempt_count?: number;
+  last_error?: string | null;
 }
 
 // One executed tool call produced by the worker's tool loop, in execution
 // order. `iteration` groups calls issued in the same LLM round-trip - this is
 // what lets persistence reconstruct exactly which tool-call assistant row
-// each result belongs to (see insertToolExchange in db.ts).
+// each result belongs to (see insertToolCallRequest/insertToolResult in
+// db.ts, called incrementally per-step rather than in bulk).
 export interface ToolExchangeRecord {
   iteration: number;
   toolCallId: string;
@@ -56,6 +74,13 @@ export interface ToolExchangeRecord {
   args?: unknown;
   result: string;
   isError: boolean;
+  /**
+   * Text the model streamed before this iteration's tool calls, if any.
+   * Persisted on the tool-call assistant row so history replay can keep
+   * the interleaved text -> tool call -> text ordering instead of
+   * dropping everything that came before the final answer.
+   */
+  text?: string;
 }
 
 // pi-style token-budgeted auto-compaction: one row per compaction pass. See
@@ -66,6 +91,10 @@ export interface Compaction {
   conversation_id: string;
   summary: string;
   first_kept_message_id: string;
+  // Phase 4 durable compaction: source span start + triggering turn.
+  // Nullable - NULL on compactions persisted before this field existed.
+  source_start_message_id: string | null;
+  triggered_by_message_id: string | null;
   tokens_before: number;
   prompt_tokens: number | null;
   completion_tokens: number | null;

@@ -532,4 +532,131 @@ describe("runToolLoop compaction failure handling", () => {
     const sentMessages = streamCalls[0].messages;
     expect(sentMessages.slice(1)).toEqual(history.map(rowToChatMessage)); // fell back to uncompacted
   });
+
+  it("pre-turn: an empty-string summary is treated as a failed compaction, not persisted", async () => {
+    rowSeq = 0;
+    const history = [...fullTextTurn(0, 3000), ...fullTextTurn(1, 3000), userRow("current question")];
+    const fullChat = [{ role: "system" as const, content: "sys" }, ...history.map(rowToChatMessage)];
+    const thresholdTokens = estimateMessagesTokens(fullChat as any) - 1;
+
+    const { client, streamCalls, summaryCalls } = createCombinedFakeClient(
+      [[text("final answer"), finish("stop")]],
+      [{ content: "" }]
+    );
+
+    const onCompaction = vi.fn();
+    const { content } = await runToolLoop(history, vi.fn(), undefined, {
+      client: client as any,
+      compaction: {
+        enabled: true,
+        thresholdTokens,
+        keepRecentTokens: 1,
+        previousSummary: null,
+        onCompaction,
+      },
+    });
+
+    expect(content).toBe("final answer"); // turn completes despite the empty summary
+    expect(summaryCalls).toHaveLength(1);
+    expect(onCompaction).not.toHaveBeenCalled(); // never handed to the persistence layer
+
+    const sentMessages = streamCalls[0].messages;
+    expect(sentMessages.slice(1)).toEqual(history.map(rowToChatMessage)); // fell back to uncompacted
+  });
+
+  it("pre-turn: a whitespace-only summary is treated as a failed compaction, not persisted", async () => {
+    rowSeq = 0;
+    const history = [...fullTextTurn(0, 3000), ...fullTextTurn(1, 3000), userRow("current question")];
+    const fullChat = [{ role: "system" as const, content: "sys" }, ...history.map(rowToChatMessage)];
+    const thresholdTokens = estimateMessagesTokens(fullChat as any) - 1;
+
+    const { client, summaryCalls } = createCombinedFakeClient(
+      [[text("final answer"), finish("stop")]],
+      [{ content: "   \n\t  " }]
+    );
+
+    const onCompaction = vi.fn();
+    await runToolLoop(history, vi.fn(), undefined, {
+      client: client as any,
+      compaction: {
+        enabled: true,
+        thresholdTokens,
+        keepRecentTokens: 1,
+        previousSummary: null,
+        onCompaction,
+      },
+    });
+
+    expect(summaryCalls).toHaveLength(1);
+    expect(onCompaction).not.toHaveBeenCalled();
+  });
+
+  it("mid-loop: an empty-string prefix summary skips the split, loop continues unsplit", async () => {
+    rowSeq = 0;
+    const history = [userRow("do the thing")];
+    const echo = makeEcho();
+
+    const { client, streamCalls, summaryCalls } = createCombinedFakeClient(
+      [
+        [toolCallStart(0, "call_a", "echo", "{}"), finish("tool_calls")],
+        [toolCallStart(0, "call_b", "echo", "{}"), finish("tool_calls")],
+        [text("done"), finish("stop")],
+      ],
+      [{ content: "" }]
+    );
+
+    echo.execute = vi.fn().mockImplementationOnce(() => "small result").mockImplementationOnce(() => "z".repeat(4000));
+
+    const { content } = await runToolLoop(history, vi.fn(), undefined, {
+      client: client as any,
+      tools: [echo] as any,
+      compaction: {
+        enabled: true,
+        thresholdTokens: 800,
+        keepRecentTokens: 500,
+        previousSummary: null,
+      },
+    });
+
+    expect(content).toBe("done"); // turn completes despite the empty prefix summary
+    expect(summaryCalls).toHaveLength(1);
+
+    // No split applied: iteration 2 still sees every prior message in full,
+    // not a summary placeholder.
+    const sentMessages = streamCalls[2].messages;
+    expect(sentMessages.some((m: any) => typeof m.content === "string" && m.content.includes("Turn context checkpoint"))).toBe(
+      false
+    );
+  });
+
+  it("pre-turn: persists the exact source span (start + retained boundary) used for the summary", async () => {
+    rowSeq = 0;
+    const history = [...fullTextTurn(0, 3000), ...fullTextTurn(1, 3000), userRow("current question")];
+    const fullChat = [{ role: "system" as const, content: "sys" }, ...history.map(rowToChatMessage)];
+    const thresholdTokens = estimateMessagesTokens(fullChat as any) - 1;
+
+    const { client } = createCombinedFakeClient(
+      [[text("final answer"), finish("stop")]],
+      [{ content: "SUMMARY TEXT" }]
+    );
+
+    const onCompaction = vi.fn();
+    await runToolLoop(history, vi.fn(), undefined, {
+      client: client as any,
+      compaction: {
+        enabled: true,
+        thresholdTokens,
+        keepRecentTokens: 1, // tiny -> keeps only the current turn
+        previousSummary: null,
+        onCompaction,
+      },
+    });
+
+    expect(onCompaction).toHaveBeenCalledWith(
+      expect.objectContaining({
+        sourceStartMessageId: history[0].id, // start of the summarized span
+        firstKeptMessageId: history[history.length - 1].id, // retained boundary
+      })
+    );
+  });
 });

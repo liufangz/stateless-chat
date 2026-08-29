@@ -100,6 +100,17 @@ export interface Tool {
   description: string;
   parameters: Record<string, unknown>;
   execute(args: unknown): Promise<string> | string;
+  /**
+   * Phase 3 crash-recovery policy: whether this tool is safe to
+   * automatically re-execute after a worker crashes between issuing the
+   * call and persisting its result. Read-only tools (no external side
+   * effect) are safe to retry blind. Anything that can mutate host state
+   * (bash, file writes) MUST leave this unset/false - a crash in that
+   * window means the side effect may or may not have already happened, and
+   * database idempotency alone can't tell us which. Unset defaults to
+   * "not safe to retry", the conservative choice for an unknown tool.
+   */
+  readOnly?: boolean;
 }
 
 export type ToolEvent =
@@ -109,6 +120,9 @@ export type ToolEvent =
 export interface CompactionEntry {
   summary: string;
   firstKeptMessageId: string;
+  /** id of the first row included in the summarized span (Phase 4 durable
+   * compaction source boundary). */
+  sourceStartMessageId: string;
   tokensBefore: number;
   promptTokens: number | null;
   completionTokens: number | null;
@@ -136,12 +150,51 @@ export interface CompactionRuntimeOptions {
   onCompaction?: (entry: CompactionEntry) => Promise<void> | void;
 }
 
+/**
+ * Phase 3 durable per-step persistence hooks. Both are awaited inline in
+ * the loop - the loop does not proceed past the point that would make a
+ * skipped/failed persist unrecoverable:
+ *   - onToolCallRequest fires with one iteration's full set of calls BEFORE
+ *     any of them execute. This is the durable "the model asked for this"
+ *     record.
+ *   - onToolResult fires once per call, immediately after that call's
+ *     result is known (executed, or synthetically failed e.g. by a
+ *     finish_reason==='length' truncation), before the next call executes
+ *     or the next LLM continuation is requested.
+ * Either callback may throw (e.g. because the caller's ownership/lease
+ * check found this worker no longer owns the turn) - runToolLoop does not
+ * catch that, so it propagates out of the loop and the turn is abandoned
+ * without further execution or persistence.
+ */
+export interface ToolLoopPersistence {
+  onToolCallRequest: (
+    iteration: number,
+    calls: { toolCallId: string; toolName: string; arguments: string }[]
+  ) => Promise<void>;
+  onToolResult: (record: ToolExchangeRecord) => Promise<void>;
+}
+
 export interface ToolLoopOptions {
   client?: ChatCompletionsClient;
   tools?: Tool[];
   maxIterations?: number;
   timeoutMs?: number;
   compaction?: CompactionRuntimeOptions;
+  /**
+   * Durable per-step persistence (Phase 3). Omitted entirely by tests that
+   * don't care about persistence.
+   */
+  persistence?: ToolLoopPersistence;
+  /**
+   * First `iteration` number this invocation should use/persist, so a
+   * resumed turn's newly-issued requests don't collide with iterations a
+   * previous attempt already committed. Does NOT change how many rounds
+   * *this* invocation is allowed to run (`maxIterations` is still a
+   * per-invocation budget, not a lifetime one) - only the numbering used
+   * for the durable `iteration` column and idempotency key. Defaults to 0
+   * (a fresh turn).
+   */
+  startIteration?: number;
 }
 
 // --- Loop mechanics -----------------------------------------------------
@@ -177,7 +230,14 @@ interface ToolExecutionResult {
   isError: boolean;
 }
 
-async function executeToolCall(
+/**
+ * Executes one tool call, translating a missing tool, malformed JSON args,
+ * or a thrown error into a `{ isError: true }` result instead of letting
+ * any of those reject the caller - exported so the Phase 3 turn-recovery
+ * path (packages/worker/src/turn-recovery.ts) can re-run a pending
+ * read-only call with identical semantics to the main loop.
+ */
+export async function executeToolCall(
   tc: AccumulatedToolCall,
   toolsByName: Map<string, Tool>
 ): Promise<ToolExecutionResult> {
@@ -330,11 +390,26 @@ async function buildCompactedMessages(
       env.openaiModel
     );
 
+    // A blank summary is a failed compaction, not a usable one - never
+    // persist it and never splice it into context (it would just be a
+    // useless "Checkpoint summary:" header with nothing under it). Falling
+    // back to fullChat leaves raw history untouched and fully usable; the
+    // console.error makes the failure diagnosable without crashing the turn
+    // (compaction is a budget optimization, never a hard requirement).
+    if (!summary || summary.trim().length === 0) {
+      console.error(
+        "[tool-loop] pre-turn compaction summarization returned an empty summary - " +
+          "skipping persistence, continuing uncompacted"
+      );
+      return fullChat;
+    }
+
     if (compaction.onCompaction) {
       try {
         await compaction.onCompaction({
           summary,
           firstKeptMessageId: cut.rowId,
+          sourceStartMessageId: history[startIndex].id,
           tokensBefore: estimateMessagesTokens(fullChat),
           promptTokens: usage.promptTokens,
           completionTokens: usage.completionTokens,
@@ -387,6 +462,18 @@ async function maybeSplitTurn(
 
   try {
     const { summary } = await summarizeTurnPrefix(summarizationClient, prefixMessages, env.openaiModel);
+    // Same "blank summary = failed compaction" rule as the pre-turn path -
+    // splicing an empty checkpoint into context would just drop the prefix
+    // with nothing replacing it. Not persisted either way (mid-loop splits
+    // are loop-local), so falling back to the unmodified messages is the
+    // only guard needed here.
+    if (!summary || summary.trim().length === 0) {
+      console.error(
+        "[tool-loop] mid-loop split-turn summarization returned an empty summary - " +
+          "skipping split, continuing unsplit"
+      );
+      return messages;
+    }
     const turnSummaryMessage: ChatMessage = {
       role: "system",
       content: `Turn context checkpoint (earlier part of this turn was summarized):\n${summary}`,
@@ -406,7 +493,9 @@ async function runLoopBody(
   client: ChatCompletionsClient,
   maxIterations: number,
   timeoutMs: number,
-  compaction: CompactionRuntimeOptions | undefined
+  compaction: CompactionRuntimeOptions | undefined,
+  persistence: ToolLoopPersistence | undefined,
+  startIteration: number
 ): Promise<RunLoopResult> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
   const toolDefs = tools.map((t) => ({
@@ -452,7 +541,14 @@ async function runLoopBody(
   const deadline = Date.now() + timeoutMs;
   let exitReason: "fuse" | "deadline" = "fuse";
 
-  for (let iteration = 0; iteration < maxIterations; iteration++) {
+  for (let round = 0; round < maxIterations; round++) {
+    // `iteration` is the durable, cross-restart identifier persisted on the
+    // tool-call-request row (and used as its idempotency key); `round` is
+    // just this invocation's local loop-budget counter. A resumed turn
+    // starts `iteration` above 0 (via startIteration) but `round`/
+    // maxIterations still measure only this invocation's own budget - see
+    // ToolLoopOptions.startIteration.
+    const iteration = startIteration + round;
     if (Date.now() > deadline) {
       exitReason = "deadline";
       break;
@@ -476,8 +572,20 @@ async function runLoopBody(
     // Streamed tool-call deltas arrive keyed by their eventual array index,
     // not appended in order - accumulate by index, not by arrival order.
     const toolCallsByIndex = new Map<number, AccumulatedToolCall>();
+    // Emit tool_start the moment a tool call's id+name arrive in the stream,
+    // so the client renders a running chip immediately instead of looking
+    // stuck during a tool-only stream. The pre-execution tool_start below
+    // (with full args) may fire again - clients upsert by toolCallId.
+    const emittedToolStart = new Set<string>();
     let finishReason: string | null = null;
     let firstTokenMs: number | null = null;
+
+    const maybeEmitToolStart = (tc: { id: string; name: string }) => {
+      if (tc.id && tc.name && !emittedToolStart.has(tc.id)) {
+        emittedToolStart.add(tc.id);
+        onToolEvent?.({ type: "tool_start", toolCallId: tc.id, toolName: tc.name });
+      }
+    };
 
     for await (const chunk of stream) {
       // Usage may arrive on a chunk with empty `choices` (e.g. the final
@@ -537,6 +645,16 @@ async function runLoopBody(
       })),
     });
 
+    // Durable checkpoint #1 (Phase 3): the model's tool-call request is
+    // persisted BEFORE any of its calls execute. If this throws (e.g. the
+    // caller's lease/ownership check found this worker no longer owns the
+    // turn), the loop aborts here - nothing below has run yet, so there is
+    // nothing to roll back.
+    await persistence?.onToolCallRequest(
+      iteration,
+      toolCalls.map((tc) => ({ toolCallId: tc.id, toolName: tc.name, arguments: tc.arguments }))
+    );
+
     if (finishReason === "length") {
       // Truncated mid-tool-call: args may be incomplete, so don't execute -
       // fail the pending calls and let the model retry with more room.
@@ -545,8 +663,7 @@ async function runLoopBody(
         onToolEvent?.({ type: "tool_end", toolCallId: tc.id, toolName: tc.name, isError: true });
         const content =
           "Error: response was truncated before this tool call completed. Please retry with a smaller request.";
-        messages.push({ role: "tool", tool_call_id: tc.id, content });
-        toolExchange.push({
+        const record: ToolExchangeRecord = {
           iteration,
           toolCallId: tc.id,
           toolName: tc.name,
@@ -554,7 +671,14 @@ async function runLoopBody(
           args: tryParseArgsForEvent(tc.arguments),
           result: content,
           isError: true,
-        });
+        };
+        // Durable checkpoint #2: result persisted before the next
+        // iteration's LLM continuation. No real execution happened here
+        // (truncated calls are never run), so there's no crash-window
+        // ambiguity to worry about for this one.
+        await persistence?.onToolResult(record);
+        messages.push({ role: "tool", tool_call_id: tc.id, content });
+        toolExchange.push(record);
       }
       continue;
     }
@@ -569,8 +693,7 @@ async function runLoopBody(
         toolName: tc.name,
         isError: result.isError,
       });
-      messages.push({ role: "tool", tool_call_id: tc.id, content: result.content });
-      toolExchange.push({
+      const record: ToolExchangeRecord = {
         iteration,
         toolCallId: tc.id,
         toolName: tc.name,
@@ -578,7 +701,17 @@ async function runLoopBody(
         args,
         result: result.content,
         isError: result.isError,
-      });
+      };
+      // Durable checkpoint #2: result persisted immediately after
+      // execution, before the next tool call executes or the next LLM
+      // continuation is requested. If a crash happens between
+      // executeToolCall returning and this persisting, a mutating tool's
+      // side effect may have already happened with no durable record of
+      // it - see turn-recovery.ts, which is what has to reason about that
+      // window on the next claim.
+      await persistence?.onToolResult(record);
+      messages.push({ role: "tool", tool_call_id: tc.id, content: result.content });
+      toolExchange.push(record);
     }
   }
 
@@ -668,7 +801,18 @@ export async function runToolLoop(
 
   try {
     return await Promise.race([
-      runLoopBody(history, onToken, onToolEvent, tools, client, maxIterations, timeoutMs, options.compaction),
+      runLoopBody(
+        history,
+        onToken,
+        onToolEvent,
+        tools,
+        client,
+        maxIterations,
+        timeoutMs,
+        options.compaction,
+        options.persistence,
+        options.startIteration ?? 0
+      ),
       timeout,
     ]);
   } finally {

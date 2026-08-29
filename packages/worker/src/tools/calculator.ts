@@ -4,6 +4,7 @@ export const calculatorTool: Tool = {
   name: "calculator",
   description:
     "Evaluate a basic arithmetic expression. Supports + - * / ^ (power), sqrt(), and parentheses.",
+  readOnly: true,
   parameters: {
     type: "object",
     properties: {

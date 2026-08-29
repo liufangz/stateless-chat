@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "start": "tsx src/index.ts",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:db": "DATABASE_URL=postgres://chat:chat@localhost:5433/chat_test vitest run"
   },
   "dependencies": {
     "@stateless-chat/shared": "*",

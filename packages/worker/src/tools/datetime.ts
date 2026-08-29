@@ -4,6 +4,7 @@ export const getCurrentDatetimeTool: Tool = {
   name: "get_current_datetime",
   description:
     "Get the current date and time, optionally formatted for a specific IANA timezone.",
+  readOnly: true,
   parameters: {
     type: "object",
     properties: {

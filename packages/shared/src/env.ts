@@ -64,4 +64,20 @@ export const env = {
   // How much of the newest context (in estimated tokens) survives a
   // compaction pass, walking backward from the newest message.
   compactionKeepRecentTokens: Number(process.env.COMPACTION_KEEP_RECENT_TOKENS ?? 20000),
+  // Phase 1 reliability: processing lease/retry tuning. A claimed row's
+  // lease_expires_at is set leaseDurationMs out from the claim; the worker
+  // renews it roughly every leaseHeartbeatMs while still working. A lease
+  // that expires without being renewed or completed is presumed abandoned
+  // (crash, kill, tsx watch restart) and becomes reclaimable by any worker.
+  leaseDurationMs: Number(process.env.LEASE_DURATION_MS ?? 45_000),
+  leaseHeartbeatMs: Number(process.env.LEASE_HEARTBEAT_MS ?? 15_000),
+  // A row whose lease has expired this many times (attempt_count) is failed
+  // out instead of reclaimed again, so a message that reliably crashes the
+  // worker (e.g. a bad tool call) can't loop forever instead of surfacing.
+  maxClaimAttempts: Number(process.env.MAX_CLAIM_ATTEMPTS ?? 3),
+  // On SIGTERM/SIGINT, the worker stops claiming new work and gives active
+  // turns this long to finish before exiting. Anything still running past
+  // the deadline is abandoned mid-flight - its lease will simply expire and
+  // become reclaimable, rather than being force-cancelled.
+  drainTimeoutMs: Number(process.env.DRAIN_TIMEOUT_MS ?? 20_000),
 };

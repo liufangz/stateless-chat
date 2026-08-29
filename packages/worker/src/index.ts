@@ -7,16 +7,22 @@ import {
   getLatestCompaction,
   insertAssistantMessage,
   insertCompaction,
-  insertToolExchange,
-  markMessageStatus,
+  insertToolCallRequest,
+  insertToolResult,
+  markMessageDone,
+  markMessageFailed,
+  renewLease,
+  stillOwnsLease,
+  sweepExhaustedLeases,
   createRedisClient,
   createRedisSubscriber,
   NEW_MESSAGE_CHANNEL,
   streamChannel,
 } from "@stateless-chat/shared";
 import type { Message } from "@stateless-chat/shared";
-import { runToolLoop } from "./tool-loop.js";
+import { runToolLoop, DEFAULT_TOOLS } from "./tool-loop.js";
 import type { CompactionEntry, ToolEvent } from "./tool-loop.js";
+import { reconcileTurnState } from "./turn-recovery.js";
 
 const pool = createPool();
 const publisher = createRedisClient();
@@ -24,6 +30,11 @@ const subscriber = createRedisSubscriber();
 
 const POLL_INTERVAL_MS = 1000;
 let claiming = false;
+let shuttingDown = false;
+
+// Tracks turns currently in flight so a graceful shutdown can wait for them
+// (up to env.drainTimeoutMs) instead of killing them outright.
+const inFlight = new Set<Promise<void>>();
 
 async function processMessage(message: Message) {
   const log = (...args: unknown[]) =>
@@ -32,10 +43,90 @@ async function processMessage(message: Message) {
   log("claimed, generating reply");
   const channel = streamChannel(message.id);
 
+  // Renewed on an interval while the turn runs, so a long-running LLM/tool
+  // loop doesn't have its lease expire (and the row get reclaimed by
+  // another worker) out from under it. If renewal ever fails, another
+  // worker has presumably already reclaimed this row - we can't safely
+  // cancel the in-flight LLM call, but the ownership check right before
+  // persisting results (below) prevents a duplicate write in that case.
+  const heartbeat = setInterval(() => {
+    renewLease(pool, message.id, env.workerId, env.leaseDurationMs)
+      .then((renewed) => {
+        if (!renewed) {
+          log("WARNING: lease renewal failed - another worker may now own this row");
+        }
+      })
+      .catch((err) => log("lease renewal error", err));
+  }, env.leaseHeartbeatMs);
+
   try {
+    // Phase 3 recovery: this row may be a fresh claim, or a reclaim of a
+    // turn a previous (crashed/killed/restarted) worker got partway
+    // through. Reconcile durable state BEFORE touching the LLM at all, so
+    // we never re-run a step that already has a committed result, and
+    // never silently guess the outcome of a mutating tool call left
+    // dangling by a crash.
+    const reconciled = await reconcileTurnState(pool, DEFAULT_TOOLS, message.conversation_id, message.id);
+
+    if (reconciled.kind === "already-final") {
+      // A previous attempt already produced and durably persisted this
+      // turn's final answer - only markMessageDone/publish were missed
+      // (the crash landed after checkpoint 5, before/during checkpoint 6).
+      // Complete the turn from that row without contacting the LLM again,
+      // so the client never sees (and the model never generates) a second
+      // answer for the same turn.
+      if (!(await stillOwnsLease(pool, message.id, env.workerId))) {
+        log("lease no longer owned while completing an already-final turn - not overwriting");
+        return;
+      }
+      const reply = reconciled.reply;
+      const durationMs = reply.duration_ms ?? null;
+      const hasUsage = reply.prompt_tokens != null && reply.completion_tokens != null;
+      const speedTps =
+        hasUsage && durationMs && durationMs > 0
+          ? Math.round((reply.completion_tokens! / (durationMs / 1000)) * 10) / 10
+          : null;
+      await markMessageDone(pool, message.id);
+      await publisher.publish(
+        channel,
+        JSON.stringify({
+          type: "done",
+          messageId: message.id,
+          content: reply.content,
+          usage: hasUsage
+            ? {
+                promptTokens: reply.prompt_tokens,
+                completionTokens: reply.completion_tokens,
+                totalTokens: (reply.prompt_tokens ?? 0) + (reply.completion_tokens ?? 0),
+              }
+            : null,
+          speedTps,
+          durationMs,
+        })
+      );
+      log("done (recovered: final reply was already durably persisted by a previous attempt)");
+      return;
+    }
+
+    if (reconciled.kind === "blocked-mutation") {
+      // A previous attempt crashed with an unresolved mutating tool call -
+      // see turn-recovery.ts for why this can't be resolved automatically.
+      // Fail the turn with a diagnosable reason instead of guessing;
+      // requeuing this message will hit the same block until an operator
+      // resolves it with scripts/resolve-tool-call.ts.
+      if (await stillOwnsLease(pool, message.id, env.workerId)) {
+        await markMessageFailed(pool, message.id, reconciled.reason);
+        await publisher.publish(channel, JSON.stringify({ type: "error", message: reconciled.reason }));
+      } else {
+        log("lease no longer owned while blocking on an unresolved mutation - not overwriting");
+      }
+      log("blocked: unresolved mutating tool call from a previous crash needs manual resolution");
+      return;
+    }
+
     const history = await getConversationHistory(pool, message.conversation_id);
     const latestCompaction = await getLatestCompaction(pool, message.conversation_id);
-    const { content, toolExchange, usage } = await runToolLoop(
+    const { content, usage } = await runToolLoop(
       history,
       (token) => {
         publisher
@@ -48,6 +139,31 @@ async function processMessage(message: Message) {
           .catch((err) => log("publish tool event failed", err));
       },
       {
+        startIteration: reconciled.startIteration,
+        persistence: {
+          // Durable checkpoint #1 (before any tool in this iteration
+          // executes): re-check ownership right here, as close to
+          // execution as we can get, so a worker whose lease was reclaimed
+          // mid-generation stops before running (not just before
+          // persisting) another iteration's tools. This narrows, but per
+          // Phase 1's existing design can't fully close, the window where
+          // two workers both execute a tool concurrently - see
+          // packages/worker/src/index.ts's existing heartbeat comment for
+          // why an in-flight LLM/tool call can't be cancelled outright.
+          onToolCallRequest: async (iteration, calls) => {
+            if (!(await stillOwnsLease(pool, message.id, env.workerId))) {
+              throw new Error("lease lost before persisting tool-call request - aborting turn");
+            }
+            await insertToolCallRequest(pool, message.conversation_id, message.id, iteration, calls);
+          },
+          // Durable checkpoint #2 (immediately after execution, before the
+          // next tool or LLM continuation): idempotent, so a duplicate
+          // call here (e.g. a race with turn-recovery resolving the same
+          // pending call) is safely a no-op rather than a duplicate row.
+          onToolResult: async (record) => {
+            await insertToolResult(pool, message.conversation_id, message.id, record);
+          },
+        },
         compaction: {
           enabled: env.compactionEnabled,
           thresholdTokens: env.compactionThresholdTokens,
@@ -59,8 +175,10 @@ async function processMessage(message: Message) {
             await insertCompaction(pool, {
               id: randomUUID(),
               conversationId: message.conversation_id,
+              triggeredByMessageId: message.id,
               summary: entry.summary,
               firstKeptMessageId: entry.firstKeptMessageId,
+              sourceStartMessageId: entry.sourceStartMessageId,
               tokensBefore: entry.tokensBefore,
               promptTokens: entry.promptTokens,
               completionTokens: entry.completionTokens,
@@ -70,8 +188,13 @@ async function processMessage(message: Message) {
       }
     );
 
-    if (toolExchange.length > 0) {
-      await insertToolExchange(pool, message.conversation_id, message.id, toolExchange);
+    // Final ownership guard: if another worker reclaimed this row while we
+    // were generating (our heartbeat failed to renew in time), skip
+    // persisting - writing now would risk a duplicate assistant reply for
+    // the same turn. The reclaiming worker's own run is authoritative.
+    if (!(await stillOwnsLease(pool, message.id, env.workerId))) {
+      log("lease no longer owned after generation finished - discarding result, not persisting");
+      return;
     }
 
     const durationMs = usage?.streamMs ?? null;
@@ -80,7 +203,13 @@ async function processMessage(message: Message) {
         ? Math.round((usage.completionTokens / (usage.streamMs / 1000)) * 10) / 10
         : null;
 
-    await insertAssistantMessage(
+    // Durable checkpoint #3 (final answer): idempotent - if a previous
+    // attempt somehow already committed this turn's final reply (it
+    // shouldn't have gotten this far without the already-final branch
+    // above catching it first, but this is the last line of defense), the
+    // unique index makes this a no-op and returns that row instead of
+    // creating a duplicate.
+    const reply = await insertAssistantMessage(
       pool,
       message.conversation_id,
       message.id,
@@ -93,46 +222,63 @@ async function processMessage(message: Message) {
           }
         : null
     );
-    await markMessageStatus(pool, message.id, "done");
+    // reply.content !== content only in the last-line-of-defense case above
+    // (another attempt's row won the race) - in that case usage/speedTps
+    // computed from this run's `usage` describe a generation that was
+    // discarded, not the row that actually got persisted, so don't publish
+    // them alongside content that doesn't match.
+    const wonInsert = reply.content === content;
+    await markMessageDone(pool, message.id);
     await publisher.publish(
       channel,
       JSON.stringify({
         type: "done",
         messageId: message.id,
-        content,
-        usage: usage
-          ? {
-              promptTokens: usage.promptTokens,
-              completionTokens: usage.completionTokens,
-              totalTokens: usage.totalTokens,
-            }
-          : null,
-        speedTps,
-        durationMs,
+        content: reply.content,
+        usage:
+          wonInsert && usage
+            ? {
+                promptTokens: usage.promptTokens,
+                completionTokens: usage.completionTokens,
+                totalTokens: usage.totalTokens,
+              }
+            : null,
+        speedTps: wonInsert ? speedTps : null,
+        durationMs: wonInsert ? durationMs : reply.duration_ms ?? null,
       })
     );
-    log("done");
+    log(wonInsert ? "done" : "done (another attempt's final reply won the race - publishing that one)");
   } catch (err) {
+    const errorMessage = err instanceof Error ? err.message : "unknown error";
     console.error(`[worker ${env.workerId}] msg=${message.id} failed`, err);
-    await markMessageStatus(pool, message.id, "failed");
-    await publisher.publish(
-      channel,
-      JSON.stringify({
-        type: "error",
-        message: err instanceof Error ? err.message : "unknown error",
-      })
-    );
+    if (await stillOwnsLease(pool, message.id, env.workerId)) {
+      await markMessageFailed(pool, message.id, errorMessage);
+      await publisher.publish(
+        channel,
+        JSON.stringify({ type: "error", message: errorMessage })
+      );
+    } else {
+      log("lease no longer owned after failure - not overwriting the reclaiming worker's row");
+    }
+  } finally {
+    clearInterval(heartbeat);
   }
 }
 
 async function claimAndProcess() {
-  if (claiming) return; // avoid overlapping claim batches from the same worker
+  if (claiming || shuttingDown) return; // avoid overlapping claim batches from the same worker
   claiming = true;
   try {
-    const claimed = await claimPendingMessages(pool, 5);
+    await sweepExhaustedLeases(pool, env.maxClaimAttempts);
+    const claimed = await claimPendingMessages(pool, env.workerId, env.leaseDurationMs, 5);
     for (const message of claimed) {
       // Fire-and-forget: process concurrently, don't block the claim loop.
-      void processMessage(message);
+      // Tracked in `inFlight` so a graceful shutdown can drain it.
+      const task = processMessage(message).finally(() => {
+        inFlight.delete(task);
+      });
+      inFlight.add(task);
+      void task;
     }
   } catch (err) {
     console.error(`[worker ${env.workerId}] claim loop error`, err);
@@ -140,6 +286,40 @@ async function claimAndProcess() {
     claiming = false;
   }
 }
+
+/**
+ * Stops claiming new work immediately, then gives active turns up to
+ * env.drainTimeoutMs to finish naturally. Anything still running past the
+ * deadline is left as-is: its lease keeps ticking and will expire on its
+ * own once this process exits, making it reclaimable by another worker
+ * instead of silently stuck in 'processing' forever.
+ */
+async function shutdown(signal: string) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`[worker ${env.workerId}] ${signal} received, draining (up to ${env.drainTimeoutMs}ms)...`);
+
+  clearInterval(pollTimer);
+  await subscriber.unsubscribe().catch(() => {});
+
+  const inFlightCount = inFlight.size;
+  if (inFlightCount > 0) {
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, env.drainTimeoutMs));
+    await Promise.race([Promise.allSettled([...inFlight]), timeout]);
+    if (inFlight.size > 0) {
+      console.log(
+        `[worker ${env.workerId}] drain window elapsed with ${inFlight.size} turn(s) still in flight - ` +
+          `leaving them for lease reclaim`
+      );
+    }
+  }
+
+  await Promise.allSettled([subscriber.quit(), publisher.quit(), pool.end()]);
+  console.log(`[worker ${env.workerId}] shutdown complete`);
+  process.exit(0);
+}
+
+let pollTimer: NodeJS.Timeout;
 
 async function main() {
   console.log(`[worker ${env.workerId}] starting`);
@@ -151,9 +331,13 @@ async function main() {
   await subscriber.subscribe(NEW_MESSAGE_CHANNEL);
 
   // ...and also poll on an interval, so messages published before this
-  // worker connected (or a missed pubsub notification) are still picked up.
-  setInterval(() => void claimAndProcess(), POLL_INTERVAL_MS);
+  // worker connected (or a missed pubsub notification, or a lease that
+  // simply expired with no notification at all) are still picked up.
+  pollTimer = setInterval(() => void claimAndProcess(), POLL_INTERVAL_MS);
   void claimAndProcess();
+
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
 
   console.log(`[worker ${env.workerId}] ready, waiting for messages`);
 }

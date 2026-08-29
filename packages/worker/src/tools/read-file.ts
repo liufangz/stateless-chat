@@ -49,6 +49,7 @@ export function createReadFileTool(options?: ReadFileToolOptions): Tool {
     description:
       `Read a text file's contents. Output is truncated to ${MAX_LINES} lines or ${MAX_CHARS} chars, ` +
       "whichever is hit first. Use offset/limit to page through a large file.",
+    readOnly: true,
     parameters: {
       type: "object",
       properties: {
