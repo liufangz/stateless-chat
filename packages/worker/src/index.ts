@@ -270,15 +270,20 @@ async function claimAndProcess() {
   claiming = true;
   try {
     await sweepExhaustedLeases(pool, env.maxClaimAttempts);
-    const claimed = await claimPendingMessages(pool, env.workerId, env.leaseDurationMs, 5);
+    // Process one turn at a time. This prevents two turns from the same
+    // conversation being reclaimed together and interleaving their durable
+    // assistant/tool rows, which would produce an invalid model history.
+    const claimed = await claimPendingMessages(pool, env.workerId, env.leaseDurationMs, 1);
     for (const message of claimed) {
-      // Fire-and-forget: process concurrently, don't block the claim loop.
-      // Tracked in `inFlight` so a graceful shutdown can drain it.
-      const task = processMessage(message).finally(() => {
-        inFlight.delete(task);
-      });
+      // Await the turn before claiming another one. Tracked in `inFlight`
+      // so a graceful shutdown can still drain the active turn.
+      const task = processMessage(message);
       inFlight.add(task);
-      void task;
+      try {
+        await task;
+      } finally {
+        inFlight.delete(task);
+      }
     }
   } catch (err) {
     console.error(`[worker ${env.workerId}] claim loop error`, err);

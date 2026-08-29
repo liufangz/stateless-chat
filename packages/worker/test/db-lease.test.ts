@@ -32,6 +32,9 @@ import {
   markMessageFailed,
   requeueMessageForRetry,
   getMessage,
+  getConversationHistory,
+  insertToolCallRequest,
+  insertToolResult,
 } from "@stateless-chat/shared";
 import { requireDisposableTestDatabase } from "./support/require-test-database.js";
 
@@ -96,6 +99,23 @@ describe("claim / reclaim lease semantics", () => {
     expect(mine).toBeDefined();
     expect(mine!.worker_id).toBe("worker-b");
     expect(mine!.attempt_count).toBe(2);
+  });
+
+  it("reclaims a legacy processing row that has no lease columns yet", async () => {
+    const conversationId = await freshConversation();
+    const msg = await insertUserMessage(pool, conversationId, "legacy");
+    await pool.query(
+      `UPDATE messages
+       SET status = 'processing', worker_id = NULL, lease_expires_at = NULL
+       WHERE id = $1`,
+      [msg.id]
+    );
+
+    const reclaimed = await claimPendingMessages(pool, "worker-b", 30_000, 5);
+    const mine = reclaimed.find((m) => m.id === msg.id);
+    expect(mine).toBeDefined();
+    expect(mine!.worker_id).toBe("worker-b");
+    expect(mine!.attempt_count).toBe(1);
   });
 
   it("two concurrent claimers never both get the same row (SKIP LOCKED exclusion)", async () => {
@@ -244,5 +264,52 @@ describe("recovery after a simulated worker interruption", () => {
     expect(blocked).toBe(false);
     const liveRow = await getMessage(pool, liveMsg.id);
     expect(liveRow!.status).toBe("processing");
+  });
+});
+
+describe("conversation history ordering", () => {
+  it("keeps each assistant tool-call row adjacent to its tool result rows", async () => {
+    const conversationId = await freshConversation();
+    const first = await insertUserMessage(pool, conversationId, "first");
+    const second = await insertUserMessage(pool, conversationId, "second");
+
+    await insertToolCallRequest(pool, conversationId, first.id, 0, [
+      { toolCallId: "call-first", toolName: "calculator", arguments: "{}" },
+    ]);
+    await insertToolCallRequest(pool, conversationId, second.id, 0, [
+      { toolCallId: "call-second", toolName: "calculator", arguments: "{}" },
+    ]);
+    await insertToolResult(pool, conversationId, first.id, {
+      toolCallId: "call-first",
+      toolName: "calculator",
+      result: "1",
+      isError: false,
+    });
+    await insertToolResult(pool, conversationId, second.id, {
+      toolCallId: "call-second",
+      toolName: "calculator",
+      result: "2",
+      isError: false,
+    });
+
+    const history = await getConversationHistory(pool, conversationId);
+    expect(history.map((row) => row.id)).toEqual([
+      first.id,
+      expect.any(String),
+      expect.any(String),
+      second.id,
+      expect.any(String),
+      expect.any(String),
+    ]);
+    expect(history.map((row) => row.role)).toEqual([
+      "user",
+      "assistant",
+      "tool",
+      "user",
+      "assistant",
+      "tool",
+    ]);
+    expect(history[2].tool_call_id).toBe("call-first");
+    expect(history[5].tool_call_id).toBe("call-second");
   });
 });

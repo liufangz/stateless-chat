@@ -282,7 +282,15 @@ export async function getConversationHistory(
   conversationId: string
 ): Promise<Message[]> {
   const { rows } = await pool.query<Message>(
-    `SELECT * FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC`,
+    `SELECT m.*
+     FROM messages m
+     LEFT JOIN messages parent ON parent.id = m.reply_to_message_id
+     WHERE m.conversation_id = $1
+     ORDER BY
+       COALESCE(parent.created_at, m.created_at) ASC,
+       CASE WHEN m.role = 'user' THEN 0 ELSE 1 END ASC,
+       m.created_at ASC,
+       m.id ASC`,
     [conversationId]
   );
   return rows;
@@ -345,7 +353,7 @@ export async function claimPendingMessages(
        SELECT id FROM messages
        WHERE role = 'user' AND (
          status = 'pending'
-         OR (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at < now())
+         OR (status = 'processing' AND (lease_expires_at IS NULL OR lease_expires_at < now()))
        )
        ORDER BY created_at ASC
        LIMIT $1

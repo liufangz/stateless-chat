@@ -11,33 +11,44 @@
 import { createPool, requeueMessageForRetry, getMessage } from "@stateless-chat/shared";
 
 const messageId = process.argv[2];
-if (!messageId) {
-  console.error("usage: npx tsx scripts/requeue-message.ts <messageId>");
-  process.exit(1);
-}
 
-const pool = createPool();
-try {
-  const before = await getMessage(pool, messageId);
-  if (!before) {
-    console.error(`no message found with id ${messageId}`);
-    process.exit(1);
+async function main(): Promise<void> {
+  if (!messageId) {
+    console.error("usage: npx tsx scripts/requeue-message.ts <messageId>");
+    process.exitCode = 1;
+    return;
   }
-  console.log(
-    `message ${messageId}: status=${before.status} attempt_count=${before.attempt_count ?? 0} ` +
-      `last_error=${before.last_error ?? "(none)"}`
-  );
 
-  const requeued = await requeueMessageForRetry(pool, messageId);
-  if (!requeued) {
-    console.error(
-      "not requeued: message is not a user row, is already pending/done, or a worker currently " +
-        "holds a live (non-expired) processing lease on it - wait for that lease to expire, or check " +
-        "again shortly if a worker is actively processing it."
+  const pool = createPool();
+  try {
+    const before = await getMessage(pool, messageId);
+    if (!before) {
+      console.error(`no message found with id ${messageId}`);
+      process.exitCode = 1;
+      return;
+    }
+    console.log(
+      `message ${messageId}: status=${before.status} attempt_count=${before.attempt_count ?? 0} ` +
+        `last_error=${before.last_error ?? "(none)"}`
     );
-    process.exit(1);
+
+    const requeued = await requeueMessageForRetry(pool, messageId);
+    if (!requeued) {
+      console.error(
+        "not requeued: message is not a user row, is already pending/done, or a worker currently " +
+          "holds a live (non-expired) processing lease on it - wait for that lease to expire, or check " +
+          "again shortly if a worker is actively processing it."
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log(`requeued ${messageId} as 'pending' - it will be picked up by the next worker poll.`);
+  } finally {
+    await pool.end();
   }
-  console.log(`requeued ${messageId} as 'pending' - it will be picked up by the next worker poll.`);
-} finally {
-  await pool.end();
 }
+
+void main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
