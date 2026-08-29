@@ -35,6 +35,22 @@ function appendTextStep(steps: MessageStep[], chunk: string): MessageStep[] {
   return [...steps, { type: 'text', content: chunk }];
 }
 
+/**
+ * A conversation's last message being a 'pending'/'processing'/'failed' user
+ * row (instead of an assistant reply) means that turn never resolved on the
+ * client that started it - e.g. the tab was closed or reloaded mid-turn, or
+ * the worker crashed before writing a reply. Detecting this lets a reload
+ * resume or surface that turn instead of silently showing nothing for it
+ * (Phase 1 reliability).
+ */
+function outstandingUserMessage(messages: Message[]): Message | null {
+  const last = messages[messages.length - 1];
+  if (!last || last.role !== 'user') return null;
+  return last.status === 'pending' || last.status === 'processing' || last.status === 'failed'
+    ? last
+    : null;
+}
+
 function HamburgerIcon() {
   return (
     <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" className="h-5 w-5">
@@ -129,6 +145,8 @@ export default function App() {
             setCompactions(history.compactions);
             setInitState('ready');
             refreshConversations();
+            const outstanding = outstandingUserMessage(history.messages);
+            if (outstanding) resumeOutstandingTurn(convId, outstanding);
             return;
           } catch (err) {
             if (isUnauthorized(err)) throw err;
@@ -191,6 +209,8 @@ export default function App() {
       setMessages(history.messages);
       setCompactions(history.compactions);
       setErrorMessage(null);
+      const outstanding = outstandingUserMessage(history.messages);
+      if (outstanding) resumeOutstandingTurn(id, outstanding);
     } catch (err) {
       if (isUnauthorized(err)) {
         setAuthState('unauthenticated');
@@ -246,6 +266,8 @@ export default function App() {
         setMessages(history.messages);
         setCompactions(history.compactions);
         setErrorMessage(null);
+        const outstanding = outstandingUserMessage(history.messages);
+        if (outstanding) resumeOutstandingTurn(next.id, outstanding);
       } catch (err) {
         if (isUnauthorized(err)) {
           setAuthState('unauthenticated');
@@ -273,6 +295,188 @@ export default function App() {
     }
   }
 
+  // Subscribes to a turn's SSE stream and wires it to the shared streaming
+  // UI state. Used both for a message just sent (handleSend) and to resume
+  // a turn that was still pending/processing when history loaded (a reload
+  // mid-turn, or another client's turn still running) - the stream endpoint
+  // is safe to open at any point in a turn's lifecycle. `targetConversationId`
+  // is threaded through explicitly rather than read from the `conversationId`
+  // state closure, since callers may invoke this in the same tick as
+  // setConversationId (before the state update has committed).
+  function beginStream(targetConversationId: string, userMessageId: string, streamUrl: string) {
+    const assistantId = `pending-${userMessageId}`;
+    setMessages((prev) => {
+      if (prev.some((m) => m.id === assistantId)) return prev;
+      const assistantMessage: Message = {
+        id: assistantId,
+        role: 'assistant',
+        content: '',
+        streaming: true,
+        steps: [],
+        reply_to_message_id: userMessageId,
+      };
+      return [...prev, assistantMessage];
+    });
+    setSending(true);
+    setErrorMessage(null);
+
+    // Live tok/s estimate: tokens received / seconds since the first
+    // token. Throttled to ~300ms so re-renders don't churn on every token.
+    let tokenCount = 0;
+    let firstTokenAt = 0;
+    let lastSpeedRenderAt = 0;
+
+    streamReply(streamUrl, {
+      onToken: (chunk) => {
+        const now = Date.now();
+        tokenCount += 1;
+        if (!firstTokenAt) firstTokenAt = now;
+        let liveSpeedTps: number | undefined;
+        if (now - lastSpeedRenderAt >= 300) {
+          lastSpeedRenderAt = now;
+          const elapsedSec = (now - firstTokenAt) / 1000;
+          if (elapsedSec > 0) liveSpeedTps = Math.round((tokenCount / elapsedSec) * 10) / 10;
+        }
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: m.content + chunk,
+                  ...(liveSpeedTps !== undefined ? { liveSpeedTps } : {}),
+                  steps: appendTextStep(m.steps ?? [], chunk),
+                }
+              : m,
+          ),
+        );
+      },
+      onToolStart: ({ toolCallId, toolName, args }) => {
+        const summary = {
+          id: toolCallId,
+          name: toolName,
+          arguments: args !== undefined ? JSON.stringify(args) : undefined,
+          running: true,
+        };
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  tool_calls: [...(m.tool_calls ?? []), summary],
+                  steps: [...(m.steps ?? []), { type: 'tool', ...summary }],
+                }
+              : m,
+          ),
+        );
+      },
+      onToolEnd: ({ toolCallId, isError }) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  tool_calls: (m.tool_calls ?? []).map((tc) =>
+                    tc.id === toolCallId ? { ...tc, running: false, isError } : tc,
+                  ),
+                  steps: (m.steps ?? []).map((s) =>
+                    s.type === 'tool' && s.id === toolCallId
+                      ? { ...s, running: false, isError }
+                      : s,
+                  ),
+                }
+              : m,
+          ),
+        );
+      },
+      onDone: async (_fullContent, { speedTps, durationMs, usage }) => {
+        setSending(false);
+        // Keep the streamed message (with its ordered text/tool steps) as
+        // the final rendered turn. Swapping in the grouped history rows
+        // here flattens the interleaved tool calls back into "chips above
+        // the final message" and drops any text that streamed before a
+        // tool call - exactly the regression this UI is meant to avoid.
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  streaming: false,
+                  liveSpeedTps: null,
+                  speedTps,
+                  usage:
+                    usage && durationMs != null
+                      ? {
+                          promptTokens: usage.promptTokens,
+                          completionTokens: usage.completionTokens,
+                          durationMs,
+                        }
+                      : m.usage,
+                }
+              : m,
+          ),
+        );
+        try {
+          // Refresh compactions only; keep the in-memory turn above.
+          const history = await getHistory(targetConversationId);
+          setCompactions(history.compactions);
+        } catch {
+          // Best-effort refresh - the streamed content already rendered above.
+        }
+        refreshConversations();
+      },
+      onError: (message) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === assistantId
+              ? {
+                  ...m,
+                  content: m.content || `Error: ${message}`,
+                  streaming: false,
+                  // Surface the error even when steps-based rendering is
+                  // active (e.g. a mid-stream failure after some tool
+                  // steps already rendered).
+                  steps:
+                    m.steps && m.steps.length > 0
+                      ? [...m.steps, { type: 'text', content: `Error: ${message}` }]
+                      : m.steps,
+                }
+              : m,
+          ),
+        );
+        setSending(false);
+        refreshConversations();
+      },
+    });
+  }
+
+  // A trailing 'pending'/'processing'/'failed' user row after loading
+  // history means that turn never resolved for this client - resume live
+  // updates for it (pending/processing) or surface its failure reason
+  // (failed) instead of silently showing nothing for it.
+  function resumeOutstandingTurn(targetConversationId: string, userMessage: Message) {
+    if (userMessage.status === 'failed') {
+      const assistantId = `pending-${userMessage.id}`;
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === assistantId)) return prev;
+        const failureMessage: Message = {
+          id: assistantId,
+          role: 'assistant',
+          content: userMessage.last_error
+            ? `This reply failed: ${userMessage.last_error}`
+            : 'This reply failed.',
+          reply_to_message_id: userMessage.id,
+        };
+        return [...prev, failureMessage];
+      });
+      return;
+    }
+    beginStream(
+      targetConversationId,
+      userMessage.id,
+      `/conversations/${targetConversationId}/messages/${userMessage.id}/stream`,
+    );
+  }
+
   async function handleSend(content: string) {
     if (!conversationId || sending) return;
     setSending(true);
@@ -280,131 +484,10 @@ export default function App() {
 
     try {
       const { messageId, streamUrl } = await sendMessage(conversationId, clientIdRef.current, content);
-
       const userMessage: Message = { id: messageId, role: 'user', content };
-      const assistantId = `pending-${messageId}`;
-      const assistantMessage: Message = {
-        id: assistantId,
-        role: 'assistant',
-        content: '',
-        streaming: true,
-        steps: [],
-        reply_to_message_id: messageId,
-      };
-      setMessages((prev) => [...prev, userMessage, assistantMessage]);
+      setMessages((prev) => [...prev, userMessage]);
       refreshConversations();
-
-      const activeConversationId = conversationId;
-
-      // Live tok/s estimate: tokens received / seconds since the first
-      // token. Throttled to ~300ms so re-renders don't churn on every token.
-      let tokenCount = 0;
-      let firstTokenAt = 0;
-      let lastSpeedRenderAt = 0;
-
-      streamReply(streamUrl, {
-        onToken: (chunk) => {
-          const now = Date.now();
-          tokenCount += 1;
-          if (!firstTokenAt) firstTokenAt = now;
-          let liveSpeedTps: number | undefined;
-          if (now - lastSpeedRenderAt >= 300) {
-            lastSpeedRenderAt = now;
-            const elapsedSec = (now - firstTokenAt) / 1000;
-            if (elapsedSec > 0) liveSpeedTps = Math.round((tokenCount / elapsedSec) * 10) / 10;
-          }
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...m,
-                    content: m.content + chunk,
-                    ...(liveSpeedTps !== undefined ? { liveSpeedTps } : {}),
-                    steps: appendTextStep(m.steps ?? [], chunk),
-                  }
-                : m,
-            ),
-          );
-        },
-        onToolStart: ({ toolCallId, toolName, args }) => {
-          const summary = {
-            id: toolCallId,
-            name: toolName,
-            arguments: args !== undefined ? JSON.stringify(args) : undefined,
-            running: true,
-          };
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...m,
-                    tool_calls: [...(m.tool_calls ?? []), summary],
-                    steps: [...(m.steps ?? []), { type: 'tool', ...summary }],
-                  }
-                : m,
-            ),
-          );
-        },
-        onToolEnd: ({ toolCallId, isError }) => {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...m,
-                    tool_calls: (m.tool_calls ?? []).map((tc) =>
-                      tc.id === toolCallId ? { ...tc, running: false, isError } : tc,
-                    ),
-                    steps: (m.steps ?? []).map((s) =>
-                      s.type === 'tool' && s.id === toolCallId
-                        ? { ...s, running: false, isError }
-                        : s,
-                    ),
-                  }
-                : m,
-            ),
-          );
-        },
-        onDone: async (_fullContent, { speedTps }) => {
-          setSending(false);
-          // Show the exact speed immediately, before the history refetch
-          // below (which carries the canonical per-message usage) resolves.
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId ? { ...m, streaming: false, liveSpeedTps: null, speedTps } : m,
-            ),
-          );
-          try {
-            const history = await getHistory(activeConversationId);
-            setMessages(history.messages);
-            setCompactions(history.compactions);
-          } catch {
-            // Best-effort refresh - the streamed content already rendered above.
-          }
-          refreshConversations();
-        },
-        onError: (message) => {
-          setMessages((prev) =>
-            prev.map((m) =>
-              m.id === assistantId
-                ? {
-                    ...m,
-                    content: m.content || `Error: ${message}`,
-                    streaming: false,
-                    // Surface the error even when steps-based rendering is
-                    // active (e.g. a mid-stream failure after some tool
-                    // steps already rendered).
-                    steps:
-                      m.steps && m.steps.length > 0
-                        ? [...m.steps, { type: 'text', content: `Error: ${message}` }]
-                        : m.steps,
-                  }
-                : m,
-            ),
-          );
-          setSending(false);
-          refreshConversations();
-        },
-      });
+      beginStream(conversationId, messageId, streamUrl);
     } catch (err) {
       if (isUnauthorized(err)) {
         setAuthState('unauthenticated');

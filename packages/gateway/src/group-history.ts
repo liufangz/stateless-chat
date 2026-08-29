@@ -15,7 +15,16 @@ export interface ClientMessageUsage {
 
 export type ClientMessage = Omit<
   Message,
-  "tool_calls" | "tool_call_id" | "tool_name" | "tool_is_error" | "prompt_tokens" | "completion_tokens" | "duration_ms"
+  | "tool_calls"
+  | "tool_call_id"
+  | "tool_name"
+  | "tool_is_error"
+  | "prompt_tokens"
+  | "completion_tokens"
+  | "duration_ms"
+  | "worker_id"
+  | "lease_expires_at"
+  | "iteration"
 > & {
   tool_calls?: ClientToolCallSummary[] | null;
   usage?: ClientMessageUsage | null;
@@ -60,7 +69,19 @@ export function groupMessagesForClient(rows: Message[]): ClientMessage[] {
     if (row.role === "tool") continue;
 
     if (row.role === "assistant" && row.tool_calls && row.tool_calls.length > 0) {
-      const { tool_calls, tool_call_id, tool_name, tool_is_error, prompt_tokens, completion_tokens, duration_ms, ...rest } = row;
+      const {
+        tool_calls,
+        tool_call_id,
+        tool_name,
+        tool_is_error,
+        prompt_tokens,
+        completion_tokens,
+        duration_ms,
+        worker_id,
+        lease_expires_at,
+        iteration,
+        ...rest
+      } = row;
       result.push({
         ...rest,
         tool_calls: tool_calls.map((tc) => ({
@@ -71,7 +92,16 @@ export function groupMessagesForClient(rows: Message[]): ClientMessage[] {
         })),
       });
     } else {
-      const { tool_calls: _toolCalls, prompt_tokens, completion_tokens, duration_ms, ...rest } = row;
+      const {
+        tool_calls: _toolCalls,
+        prompt_tokens,
+        completion_tokens,
+        duration_ms,
+        worker_id,
+        lease_expires_at,
+        iteration,
+        ...rest
+      } = row;
       const { usage, speedTps } = usageFromRow(row);
       result.push({ ...rest, usage, speedTps });
     }

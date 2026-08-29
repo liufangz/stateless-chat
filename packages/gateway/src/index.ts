@@ -461,8 +461,51 @@ async function main() {
         return;
       }
 
+      // Turn isn't finished (or was left dangling by a worker crash) - replay
+      // whatever tool calls/results are already durably persisted for it
+      // (Phase 3: these are written incrementally as the loop runs, not
+      // just in bulk at the end) before joining the live stream, so a
+      // reconnect/reload doesn't lose tool progress that happened while
+      // this client was disconnected and only ever existed as a live
+      // pubsub event on the first pass. Skip any call id that's already in
+      // `buffered` (a still-active worker publishing live while we were
+      // doing this DB read) - the UI appends per event rather than
+      // upserting by id, so replaying one we're about to deliver live
+      // anyway would render it twice.
+      const bufferedCallIds = new Set(
+        buffered
+          .filter((e): e is Extract<StreamEvent, { type: "tool_start" | "tool_end" }> =>
+            e.type === "tool_start" || e.type === "tool_end"
+          )
+          .map((e) => e.toolCallId)
+      );
+      const priorRows = await getMessagesByReplyTo(pool, messageId);
+      const resultByCallId = new Map<string, { content: string; isError: boolean }>();
+      for (const row of priorRows) {
+        if (row.role === "tool" && row.tool_call_id) {
+          resultByCallId.set(row.tool_call_id, { content: row.content, isError: !!row.tool_is_error });
+        }
+      }
+      for (const row of priorRows) {
+        if (row.role !== "assistant" || !row.tool_calls || row.tool_calls.length === 0) continue;
+        for (const tc of row.tool_calls) {
+          if (bufferedCallIds.has(tc.id)) continue;
+          let args: unknown;
+          try {
+            args = tc.arguments ? JSON.parse(tc.arguments) : undefined;
+          } catch {
+            args = undefined;
+          }
+          send("tool_start", { toolCallId: tc.id, toolName: tc.name, args });
+          const outcome = resultByCallId.get(tc.id);
+          if (outcome) {
+            send("tool_end", { toolCallId: tc.id, toolName: tc.name, isError: outcome.isError });
+          }
+        }
+      }
+
       if (userMessage.status === "failed") {
-        send("error", { message: "message processing failed" });
+        send("error", { message: userMessage.last_error ?? "message processing failed" });
         res.end();
         cleanup();
         return;

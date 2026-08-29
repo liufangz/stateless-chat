@@ -55,6 +55,10 @@ export interface Message {
   liveSpeedTps?: number | null;
   /** Client-only: ordered text/tool steps of an in-progress streaming reply. */
   steps?: MessageStep[];
+  /** Set on a 'failed' user row - the reason the worker gave up (Phase 1 reliability). */
+  last_error?: string | null;
+  /** How many times this row has been claimed (fresh claim or lease reclaim). */
+  attempt_count?: number;
 }
 
 export interface CompactionSummary {
