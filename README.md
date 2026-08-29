@@ -54,6 +54,20 @@ npm run dev:worker
 
 Stop infra with `npm run infra:down` (data persists in a docker volume; add `-v` to wipe it).
 
+## Run the worker tests
+
+Some worker tests exercise real Postgres and `TRUNCATE` shared tables in `beforeAll`. Use the
+disposable test database, never the dev/prod one at `DATABASE_URL`'s default:
+
+```bash
+docker exec stateless-chat-postgres psql -U chat -d chat -c "CREATE DATABASE chat_test;"  # once
+npm run test:db -w packages/worker
+```
+
+`npm run test -w packages/worker` (no `DATABASE_URL` override) is safe to run too - each
+Postgres-backed test file refuses to start unless `DATABASE_URL` points at a database whose name
+contains `test`.
+
 ## Try it with curl
 
 ```bash
@@ -107,3 +121,21 @@ RETURNING *;
 row — each pending message is returned to exactly one worker. Workers also poll on a 1s interval
 in addition to reacting to pubsub, so a message is never stranded if a notification is missed or
 sent before any worker was connected.
+
+## Durable, non-destructive compaction
+
+Long conversations get periodically summarized ("compacted") to keep the context sent to the LLM
+under a token budget. This is purely additive: raw `messages` rows are never deleted, edited, or
+overwritten by compaction — a `compactions` row is extra metadata alongside them, and
+`GET /conversations/:conversationId/messages` always returns the full, unabridged raw history
+(including every tool call/result). Only the in-memory prompt built for the *next* LLM call
+overlays a summary in place of older messages; what's durably stored on disk is untouched.
+
+A `compactions` row records, atomically, in one INSERT: the summary text, the exact source span it
+covers (`source_start_message_id` through `first_kept_message_id`, the latter being the boundary
+row still sent in full), the turn that triggered the pass (`triggered_by_message_id`), token
+metadata, and `created_at`. An empty or whitespace-only summary is never persisted as a usable
+compaction — it's rejected in application code before any write, and backed by a
+`compactions_summary_not_blank` CHECK constraint in the schema; the turn falls back to sending
+uncompacted history to the LLM instead. `triggered_by_message_id` is also this pass's idempotency
+key: a crash-and-retry of the same turn can't create a duplicate compaction row for it.
