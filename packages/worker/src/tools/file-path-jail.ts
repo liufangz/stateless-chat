@@ -46,11 +46,39 @@ async function assertWithinRoot(candidate: string, root: string): Promise<void> 
   }
 }
 
+const REPO_ALIAS = "/repo";
+
 /**
- * Resolve a virtual read path ("/repo/...", or a bare relative path resolved
- * under the project root) to a real, existing, jailed file path. Throws on
- * traversal, hard-blocked names (.env/.git/node_modules), a missing file, or
- * a symlink that resolves outside the root.
+ * Strip the virtual "/repo" alias used when the worker ran in a sandbox where
+ * the project was mounted at /repo. Returns the sub-path under the root, or
+ * null if the path doesn't use the alias. The alias is kept for
+ * backward-compatibility; on the host the real project path is accepted too.
+ */
+function stripRepoAlias(rawPath: string): string | null {
+  if (rawPath === REPO_ALIAS) return "";
+  if (rawPath.startsWith(REPO_ALIAS + "/")) return rawPath.slice(REPO_ALIAS.length);
+  return null;
+}
+
+/**
+ * Map a tool-supplied path to a candidate under the repo root:
+ *   - "/repo/..." (sandbox-era alias)  -> repoRoot + sub
+ *   - a real absolute path             -> itself (containment checked later)
+ *   - a bare relative path             -> repoRoot + "/" + path
+ */
+function resolveCandidate(rawPath: string, root: string): string {
+  const alias = stripRepoAlias(rawPath);
+  if (alias !== null) return path.join(root, alias);
+  if (rawPath.startsWith("/")) return rawPath;
+  return path.join(root, `/${rawPath}`);
+}
+
+/**
+ * Resolve a tool-supplied read path ("/repo/...", a real absolute path under
+ * the project root, or a bare relative path resolved under the project root)
+ * to a real, existing, jailed file path. Throws on traversal, hard-blocked
+ * names (.env/.git/node_modules), a missing file, an absolute path outside
+ * the root, or a symlink that resolves outside the root.
  */
 export async function resolveReadPath(rawPath: string, roots: PathJailRoots): Promise<string> {
   if (typeof rawPath !== "string" || rawPath.trim() === "") {
@@ -60,17 +88,8 @@ export async function resolveReadPath(rawPath: string, roots: PathJailRoots): Pr
     throw new Error(`path must not contain '..' segments: ${rawPath}`);
   }
 
-  let sub: string;
-  if (rawPath === "/repo" || rawPath.startsWith("/repo/")) {
-    sub = rawPath.slice("/repo".length);
-  } else if (rawPath.startsWith("/")) {
-    throw new Error(`Absolute paths must start with /repo/, got: ${rawPath}`);
-  } else {
-    sub = `/${rawPath}`;
-  }
-
   const root = roots.repoRoot;
-  const candidate = path.join(root, sub);
+  const candidate = resolveCandidate(rawPath, root);
   rejectIfHardBlocked(candidate);
 
   let realPath: string;
@@ -90,11 +109,12 @@ export async function resolveReadPath(rawPath: string, roots: PathJailRoots): Pr
 }
 
 /**
- * Resolve a virtual write/edit path ("/repo/..." or a bare relative path) to
- * an absolute path jailed under the project root. The file need not exist
- * yet - symlink escape is checked against the nearest existing ancestor
- * directory instead of the (possibly not-yet-created) target itself. Throws
- * on traversal, non-root absolute paths, or hard-blocked names.
+ * Resolve a tool-supplied write/edit path ("/repo/...", a real absolute path
+ * under the project root, or a bare relative path) to an absolute path jailed
+ * under the project root. The file need not exist yet - symlink escape is
+ * checked against the nearest existing ancestor directory instead of the
+ * (possibly not-yet-created) target itself. Throws on traversal, absolute
+ * paths outside the root, or hard-blocked names.
  */
 export async function resolveWritePath(rawPath: string, roots: PathJailRoots): Promise<string> {
   if (typeof rawPath !== "string" || rawPath.trim() === "") {
@@ -104,17 +124,8 @@ export async function resolveWritePath(rawPath: string, roots: PathJailRoots): P
     throw new Error(`path must not contain '..' segments: ${rawPath}`);
   }
 
-  let sub: string;
-  if (rawPath === "/repo" || rawPath.startsWith("/repo/")) {
-    sub = rawPath.slice("/repo".length);
-  } else if (rawPath.startsWith("/")) {
-    throw new Error(`Cannot write outside the project root. Path must be relative or start with /repo/, got: ${rawPath}`);
-  } else {
-    sub = `/${rawPath}`;
-  }
-
   const root = roots.repoRoot;
-  const candidate = path.join(root, sub);
+  const candidate = resolveCandidate(rawPath, root);
   rejectIfHardBlocked(candidate);
   await assertWithinRoot(candidate, root);
 

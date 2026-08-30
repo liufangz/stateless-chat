@@ -56,7 +56,8 @@ export function createReadFileTool(options?: ReadFileToolOptions): Tool {
         path: {
           type: "string",
           description:
-            "File path. Relative paths resolve under the project root. Absolute paths must start with /repo/.",
+            "File path. Relative paths resolve under the project root; absolute paths under the " +
+            "project root (or the /repo/ sandbox alias) are also accepted.",
         },
         offset: { type: "number", description: "1-indexed line to start reading from" },
         limit: { type: "number", description: "Max number of lines to read" },

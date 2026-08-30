@@ -35,6 +35,14 @@ describe("edit_file tool", () => {
     expect(await fs.readFile(path.join(repoRoot, "note.txt"), "utf-8")).toBe("hello there");
   });
 
+  it("edits a file under a real absolute path inside the project root", async () => {
+    const real = path.join(repoRoot, "note.txt");
+    await fs.writeFile(real, "hello world");
+    const tool = createEditFileTool({ roots });
+    await tool.execute({ path: real, old_string: "world", new_string: "there" });
+    expect(await fs.readFile(real, "utf-8")).toBe("hello there");
+  });
+
   it("edits a file that is not itself writable, via rename instead of an in-place write", async () => {
     const targetPath = path.join(repoRoot, "note.txt");
     await fs.writeFile(targetPath, "hello world");
@@ -71,7 +79,7 @@ describe("edit_file tool", () => {
     const tool = createEditFileTool({ roots });
     await expect(
       tool.execute({ path: "/work/README.md", old_string: "world", new_string: "there" })
-    ).rejects.toThrow(/Cannot write outside/);
+    ).rejects.toThrow(/escapes the allowed root/);
   });
 
   it("rejects .env edits even under /repo", async () => {

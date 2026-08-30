@@ -31,6 +31,13 @@ describe("write_file tool", () => {
     expect(await fs.readFile(path.join(repoRoot, "sub", "note.txt"), "utf-8")).toBe("hi");
   });
 
+  it("writes under a real absolute path inside the project root", async () => {
+    const tool = createWriteFileTool({ roots });
+    const real = path.join(repoRoot, "sub", "note.txt");
+    await tool.execute({ path: real, content: "hi" });
+    expect(await fs.readFile(real, "utf-8")).toBe("hi");
+  });
+
   it("creates parent directories automatically", async () => {
     const tool = createWriteFileTool({ roots });
     await tool.execute({ path: "a/b/c/note.txt", content: "deep" });
@@ -66,7 +73,9 @@ describe("write_file tool", () => {
 
   it("rejects /work/... as outside the root, before writing", async () => {
     const tool = createWriteFileTool({ roots });
-    await expect(tool.execute({ path: "/work/note.txt", content: "x" })).rejects.toThrow(/Cannot write outside/);
+    await expect(tool.execute({ path: "/work/note.txt", content: "x" })).rejects.toThrow(
+      /escapes the allowed root/
+    );
   });
 
   it("rejects '..' traversal", async () => {

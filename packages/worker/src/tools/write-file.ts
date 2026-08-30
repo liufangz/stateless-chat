@@ -26,7 +26,8 @@ export function createWriteFileTool(options?: WriteFileToolOptions): Tool {
           type: "string",
           description:
             "File path under the project root. Relative paths resolve under the project root; absolute " +
-            "paths must start with /repo/. Writes to .env, .git, or node_modules are rejected.",
+            "paths under the project root (or the /repo/ sandbox alias) are also accepted. Writes to " +
+            ".env, .git, or node_modules are rejected.",
         },
         content: { type: "string", description: "Full file content (overwrites if the file exists)" },
       },

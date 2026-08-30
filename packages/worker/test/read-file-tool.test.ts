@@ -42,14 +42,27 @@ describe("read_file tool", () => {
     expect(hintPart).toMatch(/^\[8 more lines in file\. Use offset=3 to continue\.\]$/);
   });
 
-  it("rejects absolute paths outside the root", async () => {
+  it("resolves a real absolute path under the project root", async () => {
+    await fs.writeFile(path.join(repoRoot, "README.md"), "docs");
     const tool = createReadFileTool({ roots });
-    await expect(tool.execute({ path: "/etc/passwd" })).rejects.toThrow(/must start with \/repo\//);
+    const real = path.join(repoRoot, "README.md");
+    expect(await tool.execute({ path: real })).toBe(
+      `<file path="${real}" lines="1-1">\ndocs\n</file>`
+    );
   });
 
-  it("rejects /work/... as an absolute path outside the root", async () => {
+  it("rejects absolute paths outside the root", async () => {
     const tool = createReadFileTool({ roots });
-    await expect(tool.execute({ path: "/work/note.txt" })).rejects.toThrow(/must start with \/repo\//);
+    await expect(tool.execute({ path: "/etc/passwd" })).rejects.toThrow(/escapes the allowed root/);
+  });
+
+  it("rejects an existing absolute path outside the root", async () => {
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "read-tool-outside-"));
+    const outsideFile = path.join(outside, "note.txt");
+    await fs.writeFile(outsideFile, "x");
+    const tool = createReadFileTool({ roots });
+    await expect(tool.execute({ path: outsideFile })).rejects.toThrow(/escapes the allowed root/);
+    await fs.rm(outside, { recursive: true, force: true });
   });
 
   it("rejects .env paths even nominally under /repo", async () => {
