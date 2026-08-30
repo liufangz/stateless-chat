@@ -1,6 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
 import type { Message } from "@stateless-chat/shared";
-import { env } from "@stateless-chat/shared";
 import {
   runToolLoop,
   DEFAULT_TOOLS,
@@ -162,9 +161,11 @@ describe("runToolLoop", () => {
     expect(toolMsg.content).toMatch(/error/i);
   });
 
-  it("b) model keeps emitting tool_calls forever: stops at maxIterations and answers via answer-now retry", async () => {
+  it("b) model keeps emitting tool_calls forever: stops at the wall-clock deadline and answers via answer-now retry", async () => {
     const echo = makeTool("echo", () => "ok");
-    const toolOnly = () => [toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")];
+    // No iteration cap - each round eats into the 25ms deadline via its own
+    // 10ms delay, so the 3rd round's delay pushes elapsed time past it.
+    const toolOnly = () => [delay(10), toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")];
     const { client, create, calls } = createFakeClient([
       toolOnly(),
       toolOnly(),
@@ -177,10 +178,10 @@ describe("runToolLoop", () => {
     const { content, toolExchange } = await runToolLoop(makeHistory(), onToken, undefined, {
       client: client as any,
       tools: [echo] as any,
-      maxIterations: 3,
+      timeoutMs: 25,
     });
 
-    // 3 fuse iterations + 1 answer-now retry call.
+    // 3 deadline-bound tool rounds + 1 answer-now retry call.
     expect(create).toHaveBeenCalledTimes(4);
     expect(content).toBe("Retry answer");
     expect(tokens.join("")).toBe("Retry answer");
@@ -201,7 +202,7 @@ describe("runToolLoop", () => {
     const create = vi.fn().mockImplementation(async () => {
       calls++;
       if (calls <= 3) {
-        return makeStream([toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")]);
+        return makeStream([delay(10), toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")]);
       }
       throw new Error("retry network fail");
     });
@@ -210,7 +211,7 @@ describe("runToolLoop", () => {
     const { content } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
       client: client as any,
       tools: [echo] as any,
-      maxIterations: 3,
+      timeoutMs: 25,
     });
 
     expect(create).toHaveBeenCalledTimes(4);
@@ -386,7 +387,6 @@ describe("runToolLoop", () => {
     const { content } = await runToolLoop(makeHistory(), onToken, undefined, {
       client: client as any,
       tools: [echo] as any,
-      maxIterations: 50,
       timeoutMs: 10,
     });
 
@@ -508,15 +508,6 @@ describe("runToolLoop", () => {
 
     expect(content).toBe("Hi");
     expect(usage).toBeNull();
-  });
-});
-
-describe("tool loop max iterations", () => {
-  it("defaults to 200, or honors TOOL_LOOP_MAX_ITERATIONS when set in the environment", () => {
-    const expected = process.env.TOOL_LOOP_MAX_ITERATIONS
-      ? Number(process.env.TOOL_LOOP_MAX_ITERATIONS)
-      : 200;
-    expect(env.toolLoopMaxIterations).toBe(expected);
   });
 });
 

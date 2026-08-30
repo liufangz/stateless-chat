@@ -16,21 +16,25 @@ import type { SummarizationClient } from "./compaction.js";
 export { DEFAULT_TOOLS } from "./tools/index.js";
 export type { ToolExchangeRecord } from "@stateless-chat/shared";
 
-const SYSTEM_PROMPT =
-  "You are a helpful, concise assistant in a chat application. Keep replies short. " +
-  "Use the available tools when they would make your answer more accurate (e.g. exact " +
-  "date/time or arithmetic) instead of guessing. Answer the user's question directly: " +
-  "gather only what you need and then answer. Do not exhaustively survey the repository " +
-  "or read every file to answer a question — prefer a best-effort answer from available " +
-  "information.";
+const SYSTEM_PROMPT = `You are a helpful, concise assistant in a chat application.
+
+Guidelines:
+- Keep replies short and direct.
+- Use tools instead of guessing (e.g. exact date/time, arithmetic).
+- Request multiple independent tool calls in one turn instead of one at a time.
+- Gather only what's needed, then answer — don't exhaustively survey or read every file.`;
 
 export const HISTORY_LIMIT = 20;
-// pi has NO iteration cap on its tool loop (env.toolLoopMaxIterations, default
-// 200) - it's a cost fuse, not a behavior cap. Compaction owns context growth
-// (see maybeSplitTurn below); when the fuse trips or the wall-clock deadline
-// passes, the loop takes the answer-now retry path in runLoopBody, never a
-// direct fallback. Timeout history: 300s/20 iterations raised to 600s/50 on
-// 2026-08-27 at liufangz's request; now pi-style (see feat commit).
+// No iteration cap. It used to exist only to bound context growth before
+// compaction (see maybeSplitTurn below) existed - compaction now owns that,
+// and the wall-clock deadline below is what stops a loop that never stops
+// calling tools: the per-iteration deadline check in runLoopBody guarantees
+// the loop exits within timeoutMs regardless of how many rounds it took, so
+// a separate round-count fuse adds no protection an iteration count can't
+// already provide more precisely. When the deadline trips, the loop takes
+// the answer-now retry path, never a direct fallback. Timeout history:
+// 300s/20 iterations -> 600s/50 on 2026-08-27 at liufangz's request -> no
+// iteration cap at all on 2026-08-30.
 const DEFAULT_TIMEOUT_MS = 600_000;
 const FALLBACK_MESSAGE =
   "I wasn't able to finish that using my tools — could you rephrase?";
@@ -177,7 +181,6 @@ export interface ToolLoopPersistence {
 export interface ToolLoopOptions {
   client?: ChatCompletionsClient;
   tools?: Tool[];
-  maxIterations?: number;
   timeoutMs?: number;
   compaction?: CompactionRuntimeOptions;
   /**
@@ -188,11 +191,11 @@ export interface ToolLoopOptions {
   /**
    * First `iteration` number this invocation should use/persist, so a
    * resumed turn's newly-issued requests don't collide with iterations a
-   * previous attempt already committed. Does NOT change how many rounds
-   * *this* invocation is allowed to run (`maxIterations` is still a
-   * per-invocation budget, not a lifetime one) - only the numbering used
-   * for the durable `iteration` column and idempotency key. Defaults to 0
-   * (a fresh turn).
+   * previous attempt already committed. Does NOT change how long *this*
+   * invocation is allowed to run (`timeoutMs` is still a per-invocation
+   * wall-clock budget, not a lifetime one) - only the numbering used for
+   * the durable `iteration` column and idempotency key. Defaults to 0 (a
+   * fresh turn).
    */
   startIteration?: number;
 }
@@ -491,11 +494,11 @@ async function runLoopBody(
   onToolEvent: ((event: ToolEvent) => void) | undefined,
   tools: Tool[],
   client: ChatCompletionsClient,
-  maxIterations: number,
   timeoutMs: number,
   compaction: CompactionRuntimeOptions | undefined,
   persistence: ToolLoopPersistence | undefined,
-  startIteration: number
+  startIteration: number,
+  aborted: { value: boolean }
 ): Promise<RunLoopResult> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
   const toolDefs = tools.map((t) => ({
@@ -539,18 +542,26 @@ async function runLoopBody(
       : null;
 
   const deadline = Date.now() + timeoutMs;
-  let exitReason: "fuse" | "deadline" = "fuse";
 
-  for (let round = 0; round < maxIterations; round++) {
+  // Returned once `aborted.value` is observed true. By the time that
+  // happens, runToolLoop's Promise.race has already settled on the backstop
+  // rejection, so this value itself is never read - what matters is that
+  // returning here stops the loop from making another LLM call or touching
+  // persistence/publish for a turn this invocation has already given up on.
+  const abortedResult = (): RunLoopResult => ({
+    content: lastAssistantText || FALLBACK_MESSAGE,
+    toolExchange,
+    usage: buildUsage(),
+  });
+
+  for (let round = 0; ; round++) {
     // `iteration` is the durable, cross-restart identifier persisted on the
     // tool-call-request row (and used as its idempotency key); `round` is
-    // just this invocation's local loop-budget counter. A resumed turn
-    // starts `iteration` above 0 (via startIteration) but `round`/
-    // maxIterations still measure only this invocation's own budget - see
-    // ToolLoopOptions.startIteration.
+    // just this invocation's local loop counter, unbounded except by the
+    // wall-clock deadline below - see ToolLoopOptions.startIteration.
     const iteration = startIteration + round;
+    if (aborted.value) return abortedResult();
     if (Date.now() > deadline) {
-      exitReason = "deadline";
       break;
     }
 
@@ -645,6 +656,11 @@ async function runLoopBody(
       })),
     });
 
+    // The stream read above is the one await in this iteration long enough
+    // for the backstop to have tripped while we were inside it - check
+    // before touching persistence at all, not just at the top of the loop.
+    if (aborted.value) return abortedResult();
+
     // Durable checkpoint #1 (Phase 3): the model's tool-call request is
     // persisted BEFORE any of its calls execute. If this throws (e.g. the
     // caller's lease/ownership check found this worker no longer owns the
@@ -676,6 +692,7 @@ async function runLoopBody(
         // iteration's LLM continuation. No real execution happened here
         // (truncated calls are never run), so there's no crash-window
         // ambiguity to worry about for this one.
+        if (aborted.value) return abortedResult();
         await persistence?.onToolResult(record);
         messages.push({ role: "tool", tool_call_id: tc.id, content });
         toolExchange.push(record);
@@ -709,6 +726,12 @@ async function runLoopBody(
       // side effect may have already happened with no durable record of
       // it - see turn-recovery.ts, which is what has to reason about that
       // window on the next claim.
+      //
+      // executeToolCall above is the other long single await a stuck tool
+      // (e.g. a hung bash command) can sit inside past the backstop -
+      // recheck here before writing anything for the same reason as the
+      // check after the stream read.
+      if (aborted.value) return abortedResult();
       await persistence?.onToolResult(record);
       messages.push({ role: "tool", tool_call_id: tc.id, content: result.content });
       toolExchange.push(record);
@@ -716,14 +739,13 @@ async function runLoopBody(
   }
 
   console.warn(
-    exitReason === "deadline"
-      ? `[tool-loop] hit wall-clock deadline (${timeoutMs}ms) without a final answer - issuing an answer-now retry`
-      : `[tool-loop] hit max iterations (${maxIterations}) without a final answer - issuing an answer-now retry`
+    `[tool-loop] hit wall-clock deadline (${timeoutMs}ms) without a final answer - issuing an answer-now retry`
   );
 
   // pi's compact-and-retry analog: one final call, no tools, telling the
   // model to answer from whatever was gathered instead of continuing to
   // reach for more tools it no longer has budget for.
+  if (aborted.value) return abortedResult();
   try {
     const retryMessages: ChatMessage[] = [
       ...messages,
@@ -781,7 +803,6 @@ export async function runToolLoop(
   onToolEvent?: (event: ToolEvent) => void,
   options: ToolLoopOptions = {}
 ): Promise<RunLoopResult> {
-  const maxIterations = options.maxIterations ?? env.toolLoopMaxIterations;
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const tools = options.tools ?? DEFAULT_TOOLS;
   const client = options.client ?? getDefaultClient();
@@ -792,9 +813,18 @@ export async function runToolLoop(
   // This only fires for a truly stuck call (e.g. a hung tool execution)
   // that the per-iteration deadline check can't preempt mid-await.
   const backstopMs = timeoutMs + 120_000;
+  // Promise.race doesn't cancel the loser - runLoopBody keeps running
+  // in the background after this fires (nothing here can interrupt an
+  // in-flight LLM stream read or tool execution). `aborted` is how the loop
+  // finds out it lost the race, checked before every persistence write and
+  // before starting another LLM call, so a turn already reported as failed
+  // (by whoever is awaiting this call) can't still write tool-call rows or
+  // spend more tokens once it resumes from whatever it was stuck awaiting.
+  const aborted = { value: false };
   let timeoutHandle: NodeJS.Timeout;
   const timeout = new Promise<never>((_, reject) => {
     timeoutHandle = setTimeout(() => {
+      aborted.value = true;
       reject(new Error(`Tool loop timed out after ${backstopMs}ms`));
     }, backstopMs);
   });
@@ -807,11 +837,11 @@ export async function runToolLoop(
         onToolEvent,
         tools,
         client,
-        maxIterations,
         timeoutMs,
         options.compaction,
         options.persistence,
-        options.startIteration ?? 0
+        options.startIteration ?? 0,
+        aborted
       ),
       timeout,
     ]);

@@ -17,7 +17,8 @@ import type { ToolLoopPersistence, ToolExchangeRecord } from "../src/tool-loop.j
 type StreamStep =
   | { kind: "text"; content: string }
   | { kind: "tool_call"; index: number; id?: string; name?: string; argsFragment?: string }
-  | { kind: "finish"; reason: "tool_calls" | "stop" | "length" };
+  | { kind: "finish"; reason: "tool_calls" | "stop" | "length" }
+  | { kind: "delay"; ms: number };
 
 function text(content: string): StreamStep {
   return { kind: "text", content };
@@ -28,9 +29,14 @@ function toolCallStart(index: number, id: string, name: string, argsFragment = "
 function finish(reason: "tool_calls" | "stop" | "length"): StreamStep {
   return { kind: "finish", reason };
 }
+function delay(ms: number): StreamStep {
+  return { kind: "delay", ms };
+}
 
 function chunkFromStep(step: StreamStep) {
   switch (step.kind) {
+    case "delay":
+      throw new Error("delay steps must be handled by makeStream, not chunked");
     case "finish":
       return { choices: [{ delta: {}, finish_reason: step.reason }] };
     case "text":
@@ -48,7 +54,13 @@ function chunkFromStep(step: StreamStep) {
 }
 
 async function* makeStream(steps: StreamStep[]) {
-  for (const step of steps) yield chunkFromStep(step);
+  for (const step of steps) {
+    if (step.kind === "delay") {
+      await new Promise((resolve) => setTimeout(resolve, step.ms));
+      continue;
+    }
+    yield chunkFromStep(step);
+  }
 }
 
 function createFakeClient(scripts: StreamStep[][]) {
@@ -265,21 +277,23 @@ describe("startIteration (resumable numbering)", () => {
     expect(iterationsSeen).toEqual([5]);
     expect(toolExchange[0].iteration).toBe(5);
     // Still exactly 2 create() calls (one tool round + the final answer) -
-    // startIteration only renumbers the durable id, it doesn't grant extra
-    // rounds beyond maxIterations.
+    // startIteration only renumbers the durable id, it doesn't grant this
+    // invocation extra time beyond its own wall-clock budget.
     expect(calls).toHaveLength(2);
   });
 
-  it("maxIterations still caps rounds run by this invocation regardless of startIteration", async () => {
+  it("the wall-clock deadline still caps rounds run by this invocation regardless of startIteration", async () => {
     const echo = makeTool("echo", () => "ok");
-    const toolOnly = () => [toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")];
+    // 15ms deadline, 10ms delay per round: 2 tool rounds elapse ~20ms, so
+    // the 3rd round's top-of-loop check (>15ms) breaks before a 3rd create().
+    const toolOnly = () => [delay(10), toolCallStart(0, "call_x", "echo", "{}"), finish("tool_calls")];
     const { client, calls } = createFakeClient([toolOnly(), toolOnly(), [text("retry"), finish("stop")]]);
 
     const { content } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
       client: client as any,
       tools: [echo] as any,
       startIteration: 10,
-      maxIterations: 2,
+      timeoutMs: 15,
       persistence: {
         onToolCallRequest: async () => {},
         onToolResult: async () => {},
