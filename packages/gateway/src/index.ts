@@ -418,6 +418,42 @@ async function main() {
             toolName: event.toolName,
             isError: event.isError,
           });
+        } else if (
+          event.type === "agent_start" ||
+          event.type === "agent_end" ||
+          event.type === "turn_start" ||
+          event.type === "turn_end"
+        ) {
+          // pi-style agent/turn lifecycle markers.
+          send(event.type, {});
+        } else if (event.type === "message_start" || event.type === "message_end") {
+          send(event.type, {
+            role: event.role,
+            content: event.content,
+            toolCallId: event.toolCallId,
+            toolCalls: "toolCalls" in event ? event.toolCalls : undefined,
+          });
+        } else if (event.type === "message_update") {
+          send("message_update", { contentDelta: event.contentDelta });
+        } else if (event.type === "tool_execution_start") {
+          send("tool_execution_start", {
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            args: event.args,
+          });
+        } else if (event.type === "tool_execution_update") {
+          send("tool_execution_update", {
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            partialResult: event.partialResult,
+          });
+        } else if (event.type === "tool_execution_end") {
+          send("tool_execution_end", {
+            toolCallId: event.toolCallId,
+            toolName: event.toolName,
+            result: event.result,
+            isError: event.isError,
+          });
         } else if (event.type === "done") {
           send("done", {
             content: event.content,

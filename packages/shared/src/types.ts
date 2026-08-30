@@ -128,4 +128,28 @@ export type StreamEvent =
     }
   | { type: "error"; message: string }
   | { type: "tool_start"; toolCallId: string; toolName: string; args?: unknown }
-  | { type: "tool_end"; toolCallId: string; toolName: string; isError: boolean };
+  | { type: "tool_end"; toolCallId: string; toolName: string; isError: boolean }
+  // pi-style lifecycle events, relayed from the worker over the same channel.
+  // The web client ignores named events it has no listener for, so these are
+  // safe to emit alongside the existing token/tool_start/tool_end events.
+  | { type: "agent_start" }
+  | { type: "agent_end" }
+  | { type: "turn_start" }
+  | { type: "turn_end" }
+  | {
+      type: "message_start";
+      role: "user" | "assistant" | "tool";
+      content: string | null;
+      toolCallId?: string;
+      toolCalls?: Array<{ id: string; name: string; arguments: string }>;
+    }
+  | { type: "message_update"; contentDelta: string }
+  | {
+      type: "message_end";
+      role: "user" | "assistant" | "tool";
+      content: string | null;
+      toolCallId?: string;
+    }
+  | { type: "tool_execution_start"; toolCallId: string; toolName: string; args?: unknown }
+  | { type: "tool_execution_update"; toolCallId: string; toolName: string; partialResult: unknown }
+  | { type: "tool_execution_end"; toolCallId: string; toolName: string; result: string; isError: boolean };

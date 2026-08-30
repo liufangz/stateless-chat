@@ -13,8 +13,10 @@ import {
   summarizeTurnPrefix,
 } from "./compaction.js";
 import type { SummarizationClient } from "./compaction.js";
+import type { Lifecycle, LifecycleHooks, LifecycleMessage } from "./lifecycle.js";
 export { DEFAULT_TOOLS } from "./tools/index.js";
 export type { ToolExchangeRecord } from "@stateless-chat/shared";
+export type { AgentEvent, Lifecycle, LifecycleHooks, LifecycleMessage } from "./lifecycle.js";
 
 const SYSTEM_PROMPT = `You are a helpful, concise assistant in a chat application.
 
@@ -198,6 +200,22 @@ export interface ToolLoopOptions {
    * fresh turn).
    */
   startIteration?: number;
+  /**
+   * pi-style lifecycle event registry. The loop emits turn_start/turn_end,
+   * message_start/message_update/message_end (assistant text + tool
+   * results), and tool_execution_start/end through it. Listeners are
+   * awaited in subscription order and a throwing listener aborts the turn,
+   * exactly like pi's Agent.subscribe. Purely additive - omit for the old
+   * behavior.
+   */
+  lifecycle?: Lifecycle;
+  /**
+   * pi-style decision hooks. Can veto/patch tool calls
+   * (beforeToolCall/afterToolCall), stop the loop early
+   * (shouldStopAfterTurn), and inject context before an iteration
+   * (prepareNextTurn). Optional and purely additive.
+   */
+  hooks?: LifecycleHooks;
 }
 
 // --- Loop mechanics -----------------------------------------------------
@@ -337,6 +355,50 @@ export function rowToChatMessage(m: Message): ChatMessage {
     };
   }
   return { role: m.role as "user" | "assistant", content: m.content };
+}
+
+/**
+ * Converts a pi-style lifecycle message back into the loop's internal
+ * ChatMessage shape. Used by the prepareNextTurn hook to inject context
+ * before an iteration.
+ */
+export function lifecycleMessageToChatMessage(m: LifecycleMessage): ChatMessage {
+  if (m.role === "tool") {
+    return { role: "tool", content: m.content, tool_call_id: m.toolCallId ?? "" };
+  }
+  if (m.role === "assistant" && m.toolCalls && m.toolCalls.length > 0) {
+    return {
+      role: "assistant",
+      content: null,
+      tool_calls: m.toolCalls.map((tc) => ({
+        id: tc.id,
+        type: "function" as const,
+        function: { name: tc.name, arguments: tc.arguments },
+      })),
+    };
+  }
+  return { role: m.role as "user" | "assistant", content: m.content };
+}
+
+/** Snapshot of the loop's internal messages for hook/prepareNextTurn context. */
+function chatMessagesToLifecycle(messages: ChatMessage[]): LifecycleMessage[] {
+  return messages.map((m) => {
+    if (m.role === "tool") {
+      return { role: "tool", content: m.content, toolCallId: m.tool_call_id ?? undefined };
+    }
+    if (m.role === "assistant" && m.tool_calls && m.tool_calls.length > 0) {
+      return {
+        role: "assistant",
+        content: null,
+        toolCalls: m.tool_calls.map((tc) => ({
+          id: tc.id,
+          name: tc.function.name,
+          arguments: tc.function.arguments,
+        })),
+      };
+    }
+    return { role: m.role === "system" ? "user" : m.role, content: m.content };
+  });
 }
 
 export interface RunLoopUsage {
@@ -498,7 +560,9 @@ async function runLoopBody(
   compaction: CompactionRuntimeOptions | undefined,
   persistence: ToolLoopPersistence | undefined,
   startIteration: number,
-  aborted: { value: boolean }
+  aborted: { value: boolean },
+  lifecycle: Lifecycle | undefined,
+  hooks: LifecycleHooks | undefined
 ): Promise<RunLoopResult> {
   const toolsByName = new Map(tools.map((t) => [t.name, t]));
   const toolDefs = tools.map((t) => ({
@@ -565,6 +629,39 @@ async function runLoopBody(
       break;
     }
 
+    // pi-style decision hooks, both checked from the second iteration on
+    // (the first iteration always runs so the model gets its first say):
+    //   - shouldStopAfterTurn: stop the tool loop early and route through
+    //     the answer-now wrap-up below (model answers from gathered info,
+    //     no further tool calls).
+    //   - prepareNextTurn: inject extra context messages before the model
+    //     is called again.
+    if (round > 0) {
+      if (hooks?.shouldStopAfterTurn) {
+        const stop = await hooks.shouldStopAfterTurn({
+          iteration,
+          lastAssistantText,
+          toolExchange,
+        });
+        if (stop) {
+          console.warn(
+            `[tool-loop] shouldStopAfterTurn hook stopped the loop at iteration ${iteration} - wrapping up`
+          );
+          break;
+        }
+      }
+      if (hooks?.prepareNextTurn) {
+        const injected = await hooks.prepareNextTurn({
+          iteration,
+          nextIteration: iteration + 1,
+          messages: chatMessagesToLifecycle(messages),
+        });
+        if (injected && injected.length > 0) {
+          messages.push(...injected.map(lifecycleMessageToChatMessage));
+        }
+      }
+    }
+
     if (compaction?.enabled) {
       messages = await maybeSplitTurn(messages, client, compaction);
     }
@@ -591,6 +688,19 @@ async function runLoopBody(
     let finishReason: string | null = null;
     let firstTokenMs: number | null = null;
 
+    // pi-style message lifecycle for this iteration's assistant message.
+    // message_start fires on the first content or tool-call delta, then
+    // message_update per text delta, then message_end once the stream is
+    // fully assembled (full text + tool calls known).
+    let assistantMsgStarted = false;
+    const assistantLifecycleMessage = (content: string | null): LifecycleMessage => ({
+      role: "assistant",
+      content,
+      toolCalls: Array.from(toolCallsByIndex.values())
+        .filter((tc) => tc.id)
+        .map((tc) => ({ id: tc.id, name: tc.name, arguments: tc.arguments })),
+    });
+
     const maybeEmitToolStart = (tc: { id: string; name: string }) => {
       if (tc.id && tc.name && !emittedToolStart.has(tc.id)) {
         emittedToolStart.add(tc.id);
@@ -614,8 +724,17 @@ async function runLoopBody(
       const delta = choice.delta ?? {};
       if (delta.content) {
         if (firstTokenMs === null) firstTokenMs = Date.now();
+        if (!assistantMsgStarted) {
+          assistantMsgStarted = true;
+          await lifecycle?.emit({ type: "message_start", message: assistantLifecycleMessage("") });
+        }
         text += delta.content;
         onToken(delta.content);
+        await lifecycle?.emit({
+          type: "message_update",
+          message: assistantLifecycleMessage(text),
+          contentDelta: delta.content,
+        });
       }
       if (delta.tool_calls) {
         for (const tc of delta.tool_calls) {
@@ -628,6 +747,12 @@ async function runLoopBody(
             if (tc.function?.name) entry.name = tc.function.name;
           }
           if (tc.function?.arguments) entry.arguments += tc.function.arguments;
+          // Emit message_start after the entry is registered, so the
+          // message already carries the tool call that triggered it.
+          if (!assistantMsgStarted) {
+            assistantMsgStarted = true;
+            await lifecycle?.emit({ type: "message_start", message: assistantLifecycleMessage(null) });
+          }
         }
       }
       if (choice.finish_reason) finishReason = choice.finish_reason;
@@ -640,6 +765,14 @@ async function runLoopBody(
     const toolCalls = Array.from(toolCallsByIndex.entries())
       .sort((a, b) => a[0] - b[0])
       .map(([, v]) => v);
+
+    // The iteration's assistant message is complete now: emit message_end
+    // with the full assembled text and tool calls (also covers tool-only
+    // iterations, where message_start already fired on the first tool-call
+    // delta). A `text`-only early return below still gets this event.
+    if (assistantMsgStarted) {
+      await lifecycle?.emit({ type: "message_end", message: assistantLifecycleMessage(text || null) });
+    }
 
     if (toolCalls.length === 0) {
       return { content: text, toolExchange, usage: buildUsage() };
@@ -679,12 +812,24 @@ async function runLoopBody(
         onToolEvent?.({ type: "tool_end", toolCallId: tc.id, toolName: tc.name, isError: true });
         const content =
           "Error: response was truncated before this tool call completed. Please retry with a smaller request.";
+        const args = tryParseArgsForEvent(tc.arguments);
+        await lifecycle?.emit({ type: "tool_execution_start", toolCallId: tc.id, toolName: tc.name, args });
+        await lifecycle?.emit({
+          type: "tool_execution_end",
+          toolCallId: tc.id,
+          toolName: tc.name,
+          result: content,
+          isError: true,
+        });
+        const toolMsg: LifecycleMessage = { role: "tool", content, toolCallId: tc.id };
+        await lifecycle?.emit({ type: "message_start", message: toolMsg });
+        await lifecycle?.emit({ type: "message_end", message: toolMsg });
         const record: ToolExchangeRecord = {
           iteration,
           toolCallId: tc.id,
           toolName: tc.name,
           arguments: tc.arguments,
-          args: tryParseArgsForEvent(tc.arguments),
+          args,
           result: content,
           isError: true,
         };
@@ -703,19 +848,64 @@ async function runLoopBody(
     for (const tc of toolCalls) {
       const args = tryParseArgsForEvent(tc.arguments);
       onToolEvent?.({ type: "tool_start", toolCallId: tc.id, toolName: tc.name, args });
-      const result = await executeToolCall(tc, toolsByName);
+      await lifecycle?.emit({ type: "tool_execution_start", toolCallId: tc.id, toolName: tc.name, args });
+
+      // pi-style beforeToolCall: veto the call or patch its arguments
+      // before execution. A veto fails the call without running it.
+      let execArgs: unknown = args;
+      let vetoed = false;
+      let vetoReason = "";
+      const before = await hooks?.beforeToolCall?.({ toolCallId: tc.id, toolName: tc.name, args });
+      if (before?.stop) {
+        vetoed = true;
+        vetoReason = before.reason ?? `tool call stopped by beforeToolCall hook`;
+      } else if (before?.args !== undefined) {
+        execArgs = before.args;
+      }
+
+      let result: ToolExecutionResult = vetoed
+        ? { content: `Error: ${vetoReason}`, isError: true }
+        : before?.args !== undefined
+          ? await executeToolCall({ ...tc, arguments: JSON.stringify(execArgs ?? {}) }, toolsByName)
+          : await executeToolCall(tc, toolsByName);
+
+      // pi-style afterToolCall: patch the result the model sees.
+      const after =
+        vetoed || result.isError
+          ? undefined
+          : await hooks?.afterToolCall?.({
+              toolCallId: tc.id,
+              toolName: tc.name,
+              args: execArgs,
+              result: result.content,
+              isError: result.isError,
+            });
+      if (after?.result !== undefined) {
+        result = { content: after.result, isError: result.isError };
+      }
+
       onToolEvent?.({
         type: "tool_end",
         toolCallId: tc.id,
         toolName: tc.name,
         isError: result.isError,
       });
+      await lifecycle?.emit({
+        type: "tool_execution_end",
+        toolCallId: tc.id,
+        toolName: tc.name,
+        result: result.content,
+        isError: result.isError,
+      });
+      const toolMsg: LifecycleMessage = { role: "tool", content: result.content, toolCallId: tc.id };
+      await lifecycle?.emit({ type: "message_start", message: toolMsg });
+      await lifecycle?.emit({ type: "message_end", message: toolMsg });
       const record: ToolExchangeRecord = {
         iteration,
         toolCallId: tc.id,
         toolName: tc.name,
         arguments: tc.arguments,
-        args,
+        args: execArgs,
         result: result.content,
         isError: result.isError,
       };
@@ -767,6 +957,9 @@ async function runLoopBody(
 
     let retryText = "";
     let retryFirstTokenMs: number | null = null;
+    // The answer-now retry is a real assistant message too - surface it
+    // through the same message lifecycle as a normal iteration.
+    let retryMsgStarted = false;
     for await (const chunk of retryStream) {
       if (chunk.usage) {
         usageSeen = true;
@@ -778,8 +971,17 @@ async function runLoopBody(
       const delta = choice.delta ?? {};
       if (delta.content) {
         if (retryFirstTokenMs === null) retryFirstTokenMs = Date.now();
+        if (!retryMsgStarted) {
+          retryMsgStarted = true;
+          await lifecycle?.emit({ type: "message_start", message: { role: "assistant", content: "" } });
+        }
         retryText += delta.content;
         onToken(delta.content);
+        await lifecycle?.emit({
+          type: "message_update",
+          message: { role: "assistant", content: retryText },
+          contentDelta: delta.content,
+        });
       }
     }
     const retryEndMs = Date.now();
@@ -787,6 +989,9 @@ async function runLoopBody(
     if (retryFirstTokenMs !== null) totalFirstTokenMs += retryFirstTokenMs - retryStartMs;
 
     if (retryText) {
+      if (retryMsgStarted) {
+        await lifecycle?.emit({ type: "message_end", message: { role: "assistant", content: retryText } });
+      }
       return { content: retryText, toolExchange, usage: buildUsage() };
     }
     console.warn("[tool-loop] answer-now retry returned no text - falling back");
@@ -806,6 +1011,8 @@ export async function runToolLoop(
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const tools = options.tools ?? DEFAULT_TOOLS;
   const client = options.client ?? getDefaultClient();
+  const lifecycle = options.lifecycle;
+  const hooks = options.hooks;
 
   // Pure backstop, not the primary exit path anymore: the loop itself exits
   // gracefully at `timeoutMs` (checked per-iteration in runLoopBody) and
@@ -829,8 +1036,13 @@ export async function runToolLoop(
     }, backstopMs);
   });
 
+  // pi-style turn lifecycle: turn_start before anything runs, turn_end once
+  // the final message and all tool results are in (only on a normal
+  // completion - an aborted/timed-out turn rejects and never emits turn_end,
+  // matching pi's failed-run semantics).
+  await lifecycle?.emit({ type: "turn_start" });
   try {
-    return await Promise.race([
+    const result = await Promise.race([
       runLoopBody(
         history,
         onToken,
@@ -841,10 +1053,18 @@ export async function runToolLoop(
         options.compaction,
         options.persistence,
         options.startIteration ?? 0,
-        aborted
+        aborted,
+        lifecycle,
+        hooks
       ),
       timeout,
     ]);
+    await lifecycle?.emit({
+      type: "turn_end",
+      message: { role: "assistant", content: result.content },
+      toolResults: result.toolExchange,
+    });
+    return result;
   } finally {
     clearTimeout(timeoutHandle!);
   }

@@ -36,6 +36,25 @@ function appendTextStep(steps: MessageStep[], chunk: string): MessageStep[] {
 }
 
 /**
+ * SSE `token` events are text chunks, not individual model tokens. Use the
+ * same conservative character estimate as the worker for the live display;
+ * the exact provider usage replaces this estimate when `done` arrives.
+ */
+function estimateVisibleTokens(text: string): number {
+  if (!text) return 0;
+  let asciiChars = 0;
+  let nonAsciiChars = 0;
+  for (const ch of text) {
+    if (ch.codePointAt(0)! < 128) {
+      asciiChars += 1;
+    } else {
+      nonAsciiChars += 1;
+    }
+  }
+  return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
+}
+
+/**
  * A conversation's last message being a 'pending'/'processing'/'failed' user
  * row (instead of an assistant reply) means that turn never resolved on the
  * client that started it - e.g. the tab was closed or reloaded mid-turn, or
@@ -320,22 +339,26 @@ export default function App() {
     setSending(true);
     setErrorMessage(null);
 
-    // Live tok/s estimate: tokens received / seconds since the first
-    // token. Throttled to ~300ms so re-renders don't churn on every token.
-    let tokenCount = 0;
+    // Live tok/s estimate. SSE events are text chunks, not tokens, so derive
+    // a conservative estimate from the accumulated visible text rather than
+    // counting one token per event. This remains approximate until the
+    // worker's exact provider usage arrives in the done event.
+    let streamedText = '';
     let firstTokenAt = 0;
     let lastSpeedRenderAt = 0;
 
     streamReply(streamUrl, {
       onToken: (chunk) => {
         const now = Date.now();
-        tokenCount += 1;
+        streamedText += chunk;
         if (!firstTokenAt) firstTokenAt = now;
         let liveSpeedTps: number | undefined;
         if (now - lastSpeedRenderAt >= 300) {
           lastSpeedRenderAt = now;
           const elapsedSec = (now - firstTokenAt) / 1000;
-          if (elapsedSec > 0) liveSpeedTps = Math.round((tokenCount / elapsedSec) * 10) / 10;
+          if (elapsedSec > 0) {
+            liveSpeedTps = Math.round((estimateVisibleTokens(streamedText) / elapsedSec) * 10) / 10;
+          }
         }
         setMessages((prev) =>
           prev.map((m) =>
