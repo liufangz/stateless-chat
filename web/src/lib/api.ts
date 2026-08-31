@@ -97,6 +97,8 @@ export interface DoneUsage {
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
+  /** Current context occupation: the turn's latest single-call prompt size. */
+  contextTokens: number;
 }
 
 export interface StreamHandlers {

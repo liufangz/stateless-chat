@@ -14,6 +14,7 @@ import {
   getReply,
   getConversationHistory,
   getCompactionsForConversation,
+  getLatestCompaction,
   getMessagesByReplyTo,
   createRedisClient,
   createRedisSubscriber,
@@ -23,6 +24,7 @@ import {
   verifyAuthToken,
   AUTH_COOKIE_NAME,
   AUTH_COOKIE_MAX_AGE_MS,
+  estimateHistoricalContextTokens,
 } from "@stateless-chat/shared";
 import type { StreamEvent } from "@stateless-chat/shared";
 import { parseCookies, serializeCookie } from "./cookies.js";
@@ -284,9 +286,12 @@ async function main() {
         pool,
         req.params.conversationId
       );
+      // Newest first (see getCompactionsForConversation) - [0] is exactly
+      // what getLatestCompaction would return, without a second query.
+      const latestCompaction = compactions[0] ?? null;
       res.status(200).json({
         conversationId: conversation.id,
-        messages: groupMessagesForClient(messages),
+        messages: groupMessagesForClient(messages, latestCompaction),
         compactions: compactions.map((c) => ({
           id: c.id,
           summary: c.summary,
@@ -476,6 +481,17 @@ async function main() {
         // straight from Postgres and ignore anything buffered from Redis.
         const hasUsage = existingReply.prompt_tokens != null && existingReply.completion_tokens != null;
         const durationMs = existingReply.duration_ms ?? null;
+        // Legacy rows predate context_tokens - estimate the actually-
+        // retained history (system prompt + rows since the latest
+        // compaction boundary) instead of falling back to the cumulative
+        // prompt_tokens, which can vastly overstate context on a
+        // tool-heavy turn. Only fetched when actually needed.
+        let contextTokens = existingReply.context_tokens ?? null;
+        if (hasUsage && contextTokens == null) {
+          const historyRows = await getConversationHistory(pool, existingReply.conversation_id);
+          const latestCompaction = await getLatestCompaction(pool, existingReply.conversation_id);
+          contextTokens = estimateHistoricalContextTokens(historyRows, existingReply.id, latestCompaction);
+        }
         send("token", { content: existingReply.content });
         send("done", {
           content: existingReply.content,
@@ -484,6 +500,7 @@ async function main() {
                 promptTokens: existingReply.prompt_tokens,
                 completionTokens: existingReply.completion_tokens,
                 totalTokens: (existingReply.prompt_tokens ?? 0) + (existingReply.completion_tokens ?? 0),
+                contextTokens: contextTokens ?? 0,
               }
             : null,
           speedTps:

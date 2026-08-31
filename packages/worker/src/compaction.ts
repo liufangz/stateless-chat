@@ -11,69 +11,27 @@
  */
 
 import type { Message } from "@stateless-chat/shared";
+import {
+  estimateTokens,
+  estimateMessageTokens,
+  estimateMessagesTokens,
+  PER_MESSAGE_OVERHEAD_TOKENS,
+} from "@stateless-chat/shared";
+import type { CompactableMessage, CompactableToolCall } from "@stateless-chat/shared";
 
 // ============================================================================
 // Token estimation
 // ============================================================================
 
-// Conservative char-based estimator: ASCII costs ~4 chars/token (English
-// prose), non-ASCII (CJK, emoji, etc.) costs ~1.5 chars/token since those
-// scripts tokenize much denser. Overestimating is safe here - the only
-// failure mode we're guarding against is context overflow, so erring toward
-// "compact a little early" beats erring toward "blow the context window".
-export function estimateTokens(text: string): number {
-  if (!text) return 0;
-  let asciiChars = 0;
-  let nonAsciiChars = 0;
-  for (const ch of text) {
-    if (ch.codePointAt(0)! < 128) {
-      asciiChars++;
-    } else {
-      nonAsciiChars++;
-    }
-  }
-  return Math.ceil(asciiChars / 4 + nonAsciiChars / 1.5);
-}
-
-// Fixed overhead per message for role/field wire framing, mirroring pi's
-// philosophy of padding the character-based estimate rather than trying to
-// model the wire format exactly.
-const PER_MESSAGE_OVERHEAD_TOKENS = 4;
-// Applied once to the total, not per-message - accounts for JSON escaping,
-// field names repeated per message, etc. that the char-count heuristic
-// doesn't otherwise capture.
-const WIRE_SAFETY_FACTOR = 1.1;
-
-// Structural subset of tool-loop.ts's `ChatMessage` - kept independent (no
-// import) so this module has no dependency on tool-loop.ts and both can
-// import from each other's exports without a cycle.
-export interface CompactableToolCall {
-  id: string;
-  function: { name: string; arguments: string };
-}
-
-export interface CompactableMessage {
-  role: "system" | "user" | "assistant" | "tool";
-  content: string | null;
-  tool_calls?: CompactableToolCall[];
-  tool_call_id?: string;
-}
-
-function estimateMessageTokens(message: CompactableMessage): number {
-  let tokens = PER_MESSAGE_OVERHEAD_TOKENS;
-  if (message.content) tokens += estimateTokens(message.content);
-  if (message.tool_calls) {
-    for (const tc of message.tool_calls) {
-      tokens += estimateTokens(tc.function.name) + estimateTokens(tc.function.arguments);
-    }
-  }
-  return tokens;
-}
-
-export function estimateMessagesTokens(messages: CompactableMessage[]): number {
-  const total = messages.reduce((sum, m) => sum + estimateMessageTokens(m), 0);
-  return Math.ceil(total * WIRE_SAFETY_FACTOR);
-}
+// estimateTokens/estimateMessagesTokens/CompactableMessage/CompactableToolCall
+// now live in packages/shared/src/context-estimate.ts, so the gateway's
+// historical context-occupation fallback (see
+// estimateHistoricalContextTokens in that module, used by
+// packages/gateway/src/group-history.ts) can use the exact same estimator
+// the worker uses live - re-exported here so every existing import of these
+// names from "./compaction.js" keeps working unchanged.
+export { estimateTokens, estimateMessagesTokens };
+export type { CompactableMessage, CompactableToolCall };
 
 /** Same estimate, applied to a raw DB row instead of a wire ChatMessage. */
 function estimateRowTokens(row: Message): number {

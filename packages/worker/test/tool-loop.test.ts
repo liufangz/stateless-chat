@@ -467,6 +467,8 @@ describe("runToolLoop", () => {
       promptTokens: 10,
       completionTokens: 5,
       totalTokens: 15,
+      // Single round: context occupation equals that round's provider-reported prompt size.
+      contextTokens: 10,
     });
     expect(usage!.streamMs).toBeGreaterThanOrEqual(0);
     expect(usage!.firstTokenMs).toBeGreaterThanOrEqual(0);
@@ -497,6 +499,11 @@ describe("runToolLoop", () => {
       completionTokens: 10,
       totalTokens: 60,
     });
+    // Context occupation is the LAST round's prompt size (30), not the sum
+    // across both tool-loop iterations (50) - a tool-heavy turn's cumulative
+    // API usage must never be reported as its context occupation.
+    expect(usage!.contextTokens).toBe(30);
+    expect(usage!.contextTokens).not.toBe(usage!.promptTokens);
   });
 
   it("n) no usage chunk delivered: usage is null, not zeroed", async () => {

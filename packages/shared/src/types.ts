@@ -44,9 +44,21 @@ export interface Message {
   iteration?: number | null;
   // Token usage + timing (Phase: usage stats) - set only on a turn's final
   // text assistant row; NULL on tool-call/tool rows and legacy rows.
+  // prompt_tokens/completion_tokens are cumulative across every LLM
+  // round-trip the turn made (can vastly exceed the model's context window
+  // on a tool-heavy turn, since each round resends growing history) - kept
+  // for backend correctness, never shown to the user as-is.
   prompt_tokens?: number | null;
   completion_tokens?: number | null;
   duration_ms?: number | null;
+  // Context occupation (Phase: context display): the prompt size of the
+  // LAST LLM call this turn made - i.e. what's actually sent as context for
+  // the next turn (system + persisted history + active compaction summary),
+  // not the cumulative sum above. Provider-reported when available, else a
+  // conservative char-based estimate (see estimateMessagesTokens in
+  // packages/worker/src/compaction.ts). NULL on legacy rows predating this
+  // column and on tool-call/tool rows.
+  context_tokens?: number | null;
   // Processing ownership/lease (Phase 1 reliability) - only meaningful on
   // role='user' rows, which are the claimable "job" rows. worker_id +
   // lease_expires_at identify who currently owns a 'processing' row and
@@ -114,6 +126,8 @@ export interface UsageStats {
   totalTokens: number;
   streamMs: number;
   firstTokenMs: number;
+  /** See Message.context_tokens - the turn's latest single-call prompt size, not the cumulative sum above. */
+  contextTokens: number;
 }
 
 export type StreamEvent =
@@ -122,7 +136,7 @@ export type StreamEvent =
       type: "done";
       messageId: string;
       content: string;
-      usage: Pick<UsageStats, "promptTokens" | "completionTokens" | "totalTokens"> | null;
+      usage: Pick<UsageStats, "promptTokens" | "completionTokens" | "totalTokens" | "contextTokens"> | null;
       speedTps: number | null;
       durationMs: number | null;
     }

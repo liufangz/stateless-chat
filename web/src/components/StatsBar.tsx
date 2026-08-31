@@ -1,47 +1,63 @@
-import type { CompactionSummary, Message } from '../types';
+import type { Message } from '../types';
 
-function formatCompactTokens(n: number): string {
+// The model's context window. Kept in sync by hand with the backend
+// (packages/worker/src/tool-loop.ts calls out DeepSeek's 270,000-token
+// window in its own comments) - there's no shared package between the web
+// client and the backend to source this from at build time.
+export const CONTEXT_WINDOW_TOKENS = 270_000;
+
+function formatK(n: number): string {
   if (n >= 1000) {
     const k = (n / 1000).toFixed(1).replace(/\.0$/, '');
-    return `${k}k tok`;
+    return `${k}k`;
   }
-  return `${n} tok`;
+  return `${n}`;
 }
 
-export function StatsBar({
-  messages,
-  sending,
-  compactions = [],
-}: {
-  messages: Message[];
-  sending: boolean;
-  compactions?: CompactionSummary[];
-}) {
-  let totalTokens = 0;
-  let hasUsage = false;
+export interface ContextStats {
+  usedTokens: number;
+  capacityTokens: number;
+  percent: number;
+}
+
+/**
+ * Current context occupation - the latest turn's single-call prompt size
+ * (usage.contextTokens), not the sum of every LLM call a tool-heavy turn
+ * made. The same field is used whether `messages` came from a freshly
+ * streamed `done` event or a reloaded historical conversation, since both
+ * populate it identically (see MessageUsage.contextTokens).
+ */
+export function computeContextStats(messages: Message[]): ContextStats | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const used = messages[i].usage?.contextTokens;
+    if (used != null) {
+      return {
+        usedTokens: used,
+        capacityTokens: CONTEXT_WINDOW_TOKENS,
+        percent: Math.min(100, Math.round((used / CONTEXT_WINDOW_TOKENS) * 100)),
+      };
+    }
+  }
+  return null;
+}
+
+export function formatContextLabel(stats: ContextStats): string {
+  return `${formatK(stats.usedTokens)}/${formatK(stats.capacityTokens)} tok (${stats.percent}%)`;
+}
+
+export function StatsBar({ messages, sending }: { messages: Message[]; sending: boolean }) {
+  const contextStats = computeContextStats(messages);
+  const contextLabel = contextStats ? formatContextLabel(contextStats) : null;
+
   let sumCompletionTokens = 0;
   let sumDurationMs = 0;
-
   for (const m of messages) {
     if (!m.usage) continue;
-    hasUsage = true;
-    totalTokens += m.usage.promptTokens + m.usage.completionTokens;
     if (m.usage.durationMs && m.usage.durationMs > 0) {
       sumCompletionTokens += m.usage.completionTokens;
       sumDurationMs += m.usage.durationMs;
     }
   }
-
-  // Summarization calls burn real tokens too - pi counts them in session
-  // totals, so a compacted conversation's reported usage doesn't silently
-  // undercount the LLM calls that ran on its behalf.
-  for (const c of compactions) {
-    if (c.promptTokens == null || c.completionTokens == null) continue;
-    hasUsage = true;
-    totalTokens += c.promptTokens + c.completionTokens;
-  }
-
-  const totalLabel = hasUsage ? formatCompactTokens(totalTokens) : null;
   const avgSpeed = sumDurationMs > 0 ? Math.round((sumCompletionTokens / (sumDurationMs / 1000)) * 10) / 10 : null;
 
   const streamingMessage = sending ? messages.find((m) => m.streaming) : undefined;
@@ -54,7 +70,7 @@ export function StatsBar({
     speedLabel = `avg ${avgSpeed.toFixed(1)} tok/s`;
   }
 
-  const parts = [totalLabel, speedLabel].filter((p): p is string => p !== null);
+  const parts = [contextLabel, speedLabel].filter((p): p is string => p !== null);
   if (parts.length === 0) return null;
 
   return (

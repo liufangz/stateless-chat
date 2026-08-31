@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { env } from "@stateless-chat/shared";
+import { env, SYSTEM_PROMPT } from "@stateless-chat/shared";
 import type { Message, ToolExchangeRecord } from "@stateless-chat/shared";
 import { DEFAULT_TOOLS } from "./tools/index.js";
 import {
@@ -12,19 +12,16 @@ import {
   summarize,
   summarizeTurnPrefix,
 } from "./compaction.js";
-import type { SummarizationClient } from "./compaction.js";
+import type { CompactableMessage, SummarizationClient } from "./compaction.js";
 import type { Lifecycle, LifecycleHooks, LifecycleMessage } from "./lifecycle.js";
 export { DEFAULT_TOOLS } from "./tools/index.js";
 export type { ToolExchangeRecord } from "@stateless-chat/shared";
 export type { AgentEvent, Lifecycle, LifecycleHooks, LifecycleMessage } from "./lifecycle.js";
 
-const SYSTEM_PROMPT = `You are a helpful, concise assistant in a chat application.
-
-Guidelines:
-- Keep replies short and direct.
-- Use tools instead of guessing (e.g. exact date/time, arithmetic).
-- Request multiple independent tool calls in one turn instead of one at a time.
-- Gather only what's needed, then answer — don't exhaustively survey or read every file.`;
+// SYSTEM_PROMPT now lives in packages/shared/src/context-estimate.ts (moved
+// verbatim, byte-for-byte identical) so the gateway's historical
+// context-occupation fallback can count the exact same system prompt this
+// worker actually sends - see estimateHistoricalContextTokens there.
 
 export const HISTORY_LIMIT = 20;
 // No iteration cap. It used to exist only to bound context growth before
@@ -407,6 +404,16 @@ export interface RunLoopUsage {
   totalTokens: number;
   streamMs: number;
   firstTokenMs: number;
+  /**
+   * Context occupation: the prompt size of the LAST LLM call this turn
+   * made (provider-reported when that round's stream carried a usage
+   * chunk, otherwise a conservative local estimate of the messages array
+   * actually sent - see estimateMessagesTokens in compaction.ts). This is
+   * what's actually sent as context for the next turn - unlike
+   * promptTokens/totalTokens above, it is NOT summed across a tool-heavy
+   * turn's many round-trips.
+   */
+  contextTokens: number;
 }
 
 export interface RunLoopResult {
@@ -593,6 +600,15 @@ async function runLoopBody(
   let totalCompletionTokens = 0;
   let totalStreamMs = 0;
   let totalFirstTokenMs = 0;
+  // Context occupation (RunLoopUsage.contextTokens): overwritten (not
+  // accumulated) after every LLM call, so it always describes only the MOST
+  // RECENT call. Kept as cheap raw inputs (a number + a message-array
+  // reference) rather than an eagerly-computed estimate, so a round whose
+  // stream DID report usage costs nothing extra, and the (rare) fallback
+  // estimate is only ever computed on demand in buildUsage() below - never
+  // unconditionally on every round of the hot loop.
+  let latestRoundPromptTokens: number | null = null;
+  let latestRoundMessages: ChatMessage[] = [];
 
   const buildUsage = (): RunLoopUsage | null =>
     usageSeen
@@ -602,6 +618,9 @@ async function runLoopBody(
           totalTokens: totalPromptTokens + totalCompletionTokens,
           streamMs: totalStreamMs,
           firstTokenMs: totalFirstTokenMs,
+          contextTokens:
+            latestRoundPromptTokens ??
+            estimateMessagesTokens(latestRoundMessages as unknown as CompactableMessage[]),
         }
       : null;
 
@@ -666,6 +685,9 @@ async function runLoopBody(
       messages = await maybeSplitTurn(messages, client, compaction);
     }
 
+    let roundPromptTokens = 0;
+    let roundUsageSeen = false;
+
     const startMs = Date.now();
     const stream = await client.chat.completions.create({
       model: env.openaiModel,
@@ -715,8 +737,10 @@ async function runLoopBody(
       // silently dropped.
       if (chunk.usage) {
         usageSeen = true;
+        roundUsageSeen = true;
         totalPromptTokens += chunk.usage.prompt_tokens ?? 0;
         totalCompletionTokens += chunk.usage.completion_tokens ?? 0;
+        roundPromptTokens += chunk.usage.prompt_tokens ?? 0;
       }
 
       const choice = chunk.choices?.[0];
@@ -761,6 +785,13 @@ async function runLoopBody(
     const endMs = Date.now();
     totalStreamMs += endMs - startMs;
     if (firstTokenMs !== null) totalFirstTokenMs += firstTokenMs - startMs;
+    // Cheap capture only - the fallback estimate (if needed) is computed
+    // lazily in buildUsage(), not here on every round. A shallow slice()
+    // (pointer copy, not the token-counting scan) so a later push()
+    // mutating `messages` in place can't retroactively grow this snapshot
+    // out from under an eventual estimateMessagesTokens call.
+    latestRoundPromptTokens = roundUsageSeen ? roundPromptTokens : null;
+    latestRoundMessages = messages.slice();
 
     const toolCalls = Array.from(toolCallsByIndex.entries())
       .sort((a, b) => a[0] - b[0])
@@ -947,6 +978,9 @@ async function runLoopBody(
       },
     ];
 
+    let retryPromptTokens = 0;
+    let retryUsageSeen = false;
+
     const retryStartMs = Date.now();
     const retryStream = await client.chat.completions.create({
       model: env.openaiModel,
@@ -963,8 +997,10 @@ async function runLoopBody(
     for await (const chunk of retryStream) {
       if (chunk.usage) {
         usageSeen = true;
+        retryUsageSeen = true;
         totalPromptTokens += chunk.usage.prompt_tokens ?? 0;
         totalCompletionTokens += chunk.usage.completion_tokens ?? 0;
+        retryPromptTokens += chunk.usage.prompt_tokens ?? 0;
       }
       const choice = chunk.choices?.[0];
       if (!choice) continue;
@@ -987,6 +1023,10 @@ async function runLoopBody(
     const retryEndMs = Date.now();
     totalStreamMs += retryEndMs - retryStartMs;
     if (retryFirstTokenMs !== null) totalFirstTokenMs += retryFirstTokenMs - retryStartMs;
+    // retryMessages is a fresh array (built via spread above) never mutated
+    // again, so - unlike the main loop's `messages` - no snapshot is needed.
+    latestRoundPromptTokens = retryUsageSeen ? retryPromptTokens : null;
+    latestRoundMessages = retryMessages;
 
     if (retryText) {
       if (retryMsgStarted) {

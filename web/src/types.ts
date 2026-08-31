@@ -18,9 +18,13 @@ export interface ToolCallDetail {
 }
 
 export interface MessageUsage {
+  // Cumulative across every LLM round-trip the turn made - not shown to the
+  // user as a token count (see contextTokens, which the StatsBar displays).
   promptTokens: number;
   completionTokens: number;
   durationMs: number | null;
+  /** Current context occupation: the turn's latest single-call prompt size. */
+  contextTokens: number | null;
 }
 
 /**

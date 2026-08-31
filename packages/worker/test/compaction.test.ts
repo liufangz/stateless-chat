@@ -54,7 +54,8 @@ function fullTextTurn(i: number, pad = 0): Message[] {
 type StreamStep =
   | { kind: "text"; content: string }
   | { kind: "tool_call"; index: number; id?: string; name?: string; argsFragment?: string }
-  | { kind: "finish"; reason: "tool_calls" | "stop" | "length" };
+  | { kind: "finish"; reason: "tool_calls" | "stop" | "length" }
+  | { kind: "usage"; usage: { prompt_tokens: number; completion_tokens: number; total_tokens?: number } };
 
 function text(content: string): StreamStep {
   return { kind: "text", content };
@@ -65,11 +66,22 @@ function toolCallStart(index: number, id: string, name: string, argsFragment = "
 function finish(reason: "tool_calls" | "stop" | "length"): StreamStep {
   return { kind: "finish", reason };
 }
+function usageChunk(usage: {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens?: number;
+}): StreamStep {
+  return { kind: "usage", usage };
+}
 
 function chunkFromStep(step: StreamStep) {
   switch (step.kind) {
     case "finish":
       return { choices: [{ delta: {}, finish_reason: step.reason }] };
+    case "usage":
+      // Mirrors DeepSeek's real behavior: usage arrives on a trailing chunk
+      // with an EMPTY choices array, not attached to the finish chunk.
+      return { choices: [], usage: step.usage };
     case "text":
       return { choices: [{ delta: { content: step.content }, finish_reason: null }] };
     case "tool_call": {
@@ -344,6 +356,35 @@ describe("runToolLoop pre-turn compaction", () => {
     expect(sentMessages[1]).toMatchObject({ role: "system" });
     expect(sentMessages[1].content).toContain("SUMMARY TEXT");
     expect(sentMessages[2]).toMatchObject({ role: "user", content: "current question" });
+  });
+
+  it("reports context occupation for the post-compaction (summarized) messages actually sent, not the full pre-compaction history", async () => {
+    rowSeq = 0;
+    const history = [...fullTextTurn(0, 3000), ...fullTextTurn(1, 3000), userRow("current question")];
+    const fullChat = [{ role: "system" as const, content: "sys" }, ...history.map(rowToChatMessage)];
+    const thresholdTokens = estimateMessagesTokens(fullChat as any) - 1; // guarantee over-threshold
+
+    const { client } = createCombinedFakeClient(
+      [[text("final answer"), finish("stop"), usageChunk({ prompt_tokens: 87, completion_tokens: 6 })]],
+      [{ content: "SUMMARY TEXT", usage: { prompt_tokens: 123, completion_tokens: 45 } }]
+    );
+
+    const { usage } = await runToolLoop(history, vi.fn(), undefined, {
+      client: client as any,
+      compaction: {
+        enabled: true,
+        thresholdTokens,
+        keepRecentTokens: 1, // tiny -> keeps only the current turn
+        previousSummary: null,
+      },
+    });
+
+    // The provider reports 87 prompt tokens for the final call, which only
+    // saw the compacted (system + summary + current question) messages -
+    // context occupation must reflect that, not the huge pre-compaction
+    // history (whose estimate is thresholdTokens+1 tokens).
+    expect(usage!.contextTokens).toBe(87);
+    expect(usage!.contextTokens).toBeLessThan(thresholdTokens);
   });
 
   it("chains a previous summary and only summarizes the span after its kept boundary", async () => {

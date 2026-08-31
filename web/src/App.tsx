@@ -432,6 +432,7 @@ export default function App() {
                           promptTokens: usage.promptTokens,
                           completionTokens: usage.completionTokens,
                           durationMs,
+                          contextTokens: usage.contextTokens,
                         }
                       : m.usage,
                 }
@@ -581,7 +582,7 @@ export default function App() {
             {errorMessage && (
               <div className="px-4 py-1 text-center text-xs text-red-500">{errorMessage}</div>
             )}
-            <StatsBar messages={messages} sending={sending} compactions={compactions} />
+            <StatsBar messages={messages} sending={sending} />
             <Composer onSend={handleSend} disabled={sending} />
           </>
         )}

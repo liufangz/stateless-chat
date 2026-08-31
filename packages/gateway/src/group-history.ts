@@ -1,4 +1,5 @@
-import type { Message } from "@stateless-chat/shared";
+import { estimateHistoricalContextTokens } from "@stateless-chat/shared";
+import type { Compaction, Message } from "@stateless-chat/shared";
 
 export interface ClientToolCallSummary {
   id: string;
@@ -8,9 +9,22 @@ export interface ClientToolCallSummary {
 }
 
 export interface ClientMessageUsage {
+  // Cumulative across every LLM round-trip the turn made - kept for the
+  // avg tok/s calculation, never shown to the user as a token count (see
+  // contextTokens below for what the UI displays as "context occupied").
   promptTokens: number;
   completionTokens: number;
   durationMs: number | null;
+  /**
+   * Current context occupation: the turn's latest single-call prompt size,
+   * not the cumulative sum above. For a row persisted before context_tokens
+   * existed, this is a from-scratch estimate of the actually-retained
+   * history (system prompt + rows since the latest compaction boundary),
+   * NEVER the legacy cumulative promptTokens - see
+   * estimateHistoricalContextTokens in packages/shared/src/context-estimate.ts.
+   * Null only when the row has no usage at all.
+   */
+  contextTokens: number | null;
 }
 
 export type ClientMessage = Omit<
@@ -22,6 +36,7 @@ export type ClientMessage = Omit<
   | "prompt_tokens"
   | "completion_tokens"
   | "duration_ms"
+  | "context_tokens"
   | "worker_id"
   | "lease_expires_at"
   | "iteration"
@@ -31,7 +46,11 @@ export type ClientMessage = Omit<
   speedTps?: number | null;
 };
 
-function usageFromRow(row: Message): { usage: ClientMessageUsage | null; speedTps: number | null } {
+function usageFromRow(
+  row: Message,
+  rows: Message[],
+  latestCompaction: Compaction | null
+): { usage: ClientMessageUsage | null; speedTps: number | null } {
   if (row.prompt_tokens == null || row.completion_tokens == null) {
     return { usage: null, speedTps: null };
   }
@@ -40,6 +59,10 @@ function usageFromRow(row: Message): { usage: ClientMessageUsage | null; speedTp
     promptTokens: row.prompt_tokens,
     completionTokens: row.completion_tokens,
     durationMs,
+    // NEVER row.prompt_tokens here - that's the cumulative sum across every
+    // LLM round-trip the turn made, which can vastly overstate context on a
+    // tool-heavy turn (see the shared estimator's doc comment).
+    contextTokens: row.context_tokens ?? estimateHistoricalContextTokens(rows, row.id, latestCompaction),
   };
   const speedTps =
     durationMs && durationMs > 0
@@ -55,8 +78,16 @@ function usageFromRow(row: Message): { usage: ClientMessageUsage | null; speedTp
  * content - results are fetched on demand from the /tools endpoint) and
  * omitted from the output. Ordering (user, assistant msg(s), ...) is
  * otherwise unchanged.
+ *
+ * `latestCompaction` (the conversation's most recent compaction, if any) is
+ * only needed for the historical context-occupation fallback on rows
+ * lacking context_tokens - pass null when the caller hasn't loaded one
+ * (e.g. no compaction has ever run for this conversation).
  */
-export function groupMessagesForClient(rows: Message[]): ClientMessage[] {
+export function groupMessagesForClient(
+  rows: Message[],
+  latestCompaction: Compaction | null = null
+): ClientMessage[] {
   const isErrorByCall = new Map<string, boolean>();
   for (const row of rows) {
     if (row.role === "tool" && row.tool_call_id) {
@@ -77,6 +108,7 @@ export function groupMessagesForClient(rows: Message[]): ClientMessage[] {
         prompt_tokens,
         completion_tokens,
         duration_ms,
+        context_tokens,
         worker_id,
         lease_expires_at,
         iteration,
@@ -97,12 +129,13 @@ export function groupMessagesForClient(rows: Message[]): ClientMessage[] {
         prompt_tokens,
         completion_tokens,
         duration_ms,
+        context_tokens,
         worker_id,
         lease_expires_at,
         iteration,
         ...rest
       } = row;
-      const { usage, speedTps } = usageFromRow(row);
+      const { usage, speedTps } = usageFromRow(row, rows, latestCompaction);
       result.push({ ...rest, usage, speedTps });
     }
   }

@@ -58,6 +58,12 @@ ALTER TABLE messages ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS completion_tokens INTEGER;
 ALTER TABLE messages ADD COLUMN IF NOT EXISTS duration_ms INTEGER;
 
+-- Context occupation: the turn's LAST LLM call's prompt size (what's
+-- actually sent as context for the next turn), distinct from the cumulative
+-- prompt_tokens above which sums every round-trip a tool-heavy turn made.
+-- Nullable/additive - NULL on rows persisted before this column existed.
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS context_tokens INTEGER;
+
 -- pi-style token-budgeted auto-compaction: one row per compaction pass, most
 -- recent first via the index below. first_kept_message_id is the id of the
 -- first 'user' row still sent to the LLM after this compaction - the next
@@ -505,6 +511,8 @@ export interface AssistantMessageUsage {
   promptTokens: number | null;
   completionTokens: number | null;
   durationMs: number | null;
+  /** See Message.context_tokens. */
+  contextTokens: number | null;
 }
 
 /**
@@ -525,8 +533,8 @@ export async function insertAssistantMessage(
 ): Promise<Message> {
   const { rows } = await pool.query<Message>(
     `INSERT INTO messages
-       (conversation_id, role, content, status, reply_to_message_id, prompt_tokens, completion_tokens, duration_ms)
-     VALUES ($1, 'assistant', $2, 'done', $3, $4, $5, $6)
+       (conversation_id, role, content, status, reply_to_message_id, prompt_tokens, completion_tokens, duration_ms, context_tokens)
+     VALUES ($1, 'assistant', $2, 'done', $3, $4, $5, $6, $7)
      ON CONFLICT (reply_to_message_id) WHERE role = 'assistant' AND tool_calls IS NULL
      DO NOTHING
      RETURNING *`,
@@ -537,6 +545,7 @@ export async function insertAssistantMessage(
       usage?.promptTokens ?? null,
       usage?.completionTokens ?? null,
       usage?.durationMs ?? null,
+      usage?.contextTokens ?? null,
     ]
   );
   if (rows[0]) return rows[0];
