@@ -6,6 +6,7 @@ import { BASH_TOOL } from "./bash.js";
 import { READ_FILE_TOOL } from "./read-file.js";
 import { WRITE_FILE_TOOL } from "./write-file.js";
 import { EDIT_FILE_TOOL } from "./edit-file.js";
+import { SUBAGENT_TOOL_NAME, createSubagentTool } from "./subagent.js";
 
 export { getCurrentDatetimeTool } from "./datetime.js";
 export { calculatorTool, evaluateExpression } from "./calculator.js";
@@ -14,6 +15,16 @@ export { READ_FILE_TOOL, createReadFileTool } from "./read-file.js";
 export { WRITE_FILE_TOOL, createWriteFileTool } from "./write-file.js";
 export { EDIT_FILE_TOOL, createEditFileTool } from "./edit-file.js";
 export { resolveReadPath, resolveWritePath, type PathJailRoots } from "./file-path-jail.js";
+export { SUBAGENT_TOOL_NAME, createSubagentTool } from "./subagent.js";
+
+/**
+ * Static, unbound subagent: no parent lifecycle (its events go nowhere) and
+ * no parent client. The worker's runToolLoop replaces this entry per run
+ * with a run-bound subagent (parent lifecycle + client + deadline slice) -
+ * see buildRunTools in tool-loop.ts. Kept here so DEFAULT_TOOLS is always
+ * complete and self-contained for tests and crash recovery.
+ */
+export const DEFAULT_SUBAGENT_TOOL = createSubagentTool();
 
 export const DEFAULT_TOOLS: Tool[] = [
   getCurrentDatetimeTool,
@@ -22,4 +33,5 @@ export const DEFAULT_TOOLS: Tool[] = [
   ...(env.toolReadFileEnabled ? [READ_FILE_TOOL] : []),
   ...(env.toolWriteFileEnabled ? [WRITE_FILE_TOOL] : []),
   ...(env.toolEditFileEnabled ? [EDIT_FILE_TOOL] : []),
+  DEFAULT_SUBAGENT_TOOL,
 ];

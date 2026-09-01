@@ -2,6 +2,7 @@ import OpenAI from "openai";
 import { env, SYSTEM_PROMPT } from "@stateless-chat/shared";
 import type { Message, ToolExchangeRecord } from "@stateless-chat/shared";
 import { DEFAULT_TOOLS } from "./tools/index.js";
+import { createSubagentTool, SUBAGENT_TOOL_NAME } from "./tools/subagent.js";
 import {
   applyCompaction,
   estimateMessagesTokens,
@@ -15,6 +16,8 @@ import {
 import type { CompactableMessage, SummarizationClient } from "./compaction.js";
 import type { Lifecycle, LifecycleHooks, LifecycleMessage } from "./lifecycle.js";
 export { DEFAULT_TOOLS } from "./tools/index.js";
+export { createSubagentTool, SUBAGENT_TOOL_NAME } from "./tools/subagent.js";
+export type { SubagentToolOptions } from "./tools/subagent.js";
 export type { ToolExchangeRecord } from "@stateless-chat/shared";
 export type { AgentEvent, Lifecycle, LifecycleHooks, LifecycleMessage } from "./lifecycle.js";
 
@@ -226,6 +229,31 @@ function getDefaultClient(): ChatCompletionsClient {
     }) as unknown as ChatCompletionsClient;
   }
   return defaultClient;
+}
+
+/**
+ * Per-run default tool assembly: DEFAULT_TOOLS with the static subagent
+ * replaced by one bound to THIS run's client, lifecycle (so child events and
+ * progress stream through the parent's lifecycle -> SSE), and a timeout that
+ * is a slice of the parent's remaining budget (leaving headroom for the
+ * parent's own answer-now wrap-up). When the caller passes `options.tools`
+ * explicitly (e.g. a nested subagent's allowlist), this is bypassed entirely
+ * and no re-binding happens.
+ */
+function buildRunTools(
+  client: ChatCompletionsClient,
+  lifecycle: Lifecycle | undefined,
+  timeoutMs: number
+): Tool[] {
+  return DEFAULT_TOOLS.map((t) =>
+    t.name === SUBAGENT_TOOL_NAME
+      ? createSubagentTool({
+          client,
+          lifecycle,
+          timeoutMs: Math.max(30_000, Math.floor(timeoutMs * 0.7)),
+        })
+      : t
+  );
 }
 
 interface AccumulatedToolCall {
@@ -1049,10 +1077,10 @@ export async function runToolLoop(
   options: ToolLoopOptions = {}
 ): Promise<RunLoopResult> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const tools = options.tools ?? DEFAULT_TOOLS;
   const client = options.client ?? getDefaultClient();
   const lifecycle = options.lifecycle;
   const hooks = options.hooks;
+  const tools = options.tools ?? buildRunTools(client, lifecycle, timeoutMs);
 
   // Pure backstop, not the primary exit path anymore: the loop itself exits
   // gracefully at `timeoutMs` (checked per-iteration in runLoopBody) and
