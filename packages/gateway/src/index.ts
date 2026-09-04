@@ -253,13 +253,24 @@ async function main() {
       const clientId = env.disableClientScoping
         ? ""
         : String(req.query.clientId ?? req.body?.clientId ?? "").trim();
-      const deleted = await deleteConversation(
+      const outcome = await deleteConversation(
         pool,
         req.params.conversationId,
         clientId || undefined
       );
-      if (!deleted) {
+      if (outcome === "not_found") {
         res.status(404).json({ error: "conversation not found" });
+        return;
+      }
+      if (outcome === "in_progress") {
+        // Deterministic, not a race the caller has to reason about: a
+        // clear conflict instead of racing the delete against the worker's
+        // still-in-flight persistence for this turn (see deleteConversation's
+        // doc comment in packages/shared/src/db.ts for why that race is
+        // unsafe rather than merely awkward).
+        res
+          .status(409)
+          .json({ error: "conversation has a reply in progress - try again once it finishes" });
         return;
       }
       res.status(204).end();

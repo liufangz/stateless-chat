@@ -14,20 +14,20 @@ why.
 
 ## What
 
-Three tools let the model interact with the project repo (`/repo`, host path
-`REPO_ROOT`) directly, without shelling out through `bash` for every file
+Three tools let the model interact with the complete trusted-user home tree
+(`/home/ubuntu`) directly, without shelling out through `bash` for every file
 operation:
 
 - `read_file` — read a text file, with `offset`/`limit` pagination.
-- `write_file` — create or overwrite a file under the project root.
-- `edit_file` — replace one exact, unique string match in a file under the
-  project root.
+- `write_file` — create or overwrite a file under `/home/ubuntu`.
+- `edit_file` — replace one exact, unique string match in a file under
+  `/home/ubuntu`.
 
-There is a single root — the project repo — pi-style. The scratch workspace
-(`/work`, host path `WORKSPACE_DIR`) is bash-only territory: it's still
-mounted read-write into the `bash` tool's docker sandbox, but these three
-tools no longer address it at all. `/work/...` paths are rejected the same
-as any other path outside the root.
+There is a single root — the whole `/home/ubuntu` tree. Bare relative paths
+resolve there, real absolute paths under it are accepted, and `/repo/...` is
+retained as a legacy alias for the same root. Paths outside `/home/ubuntu`
+remain unavailable to these three APIs; the unrestricted `bash` tool can reach
+them because it runs as the host `ubuntu` account.
 
 All three run directly in the worker process (no `docker run`), gated behind
 their own env flag, following the `TOOL_BASH_ENABLED` precedent.
@@ -42,7 +42,7 @@ their own env flag, following the `TOOL_BASH_ENABLED` precedent.
     "type": "object",
     "properties": {
       "path": { "type": "string", "description":
-        "File path. Relative paths resolve under the project root. Absolute paths must start with /repo/." },
+        "File path. Relative paths resolve under /home/ubuntu. Absolute paths must stay under /home/ubuntu." },
       "offset": { "type": "number", "description": "1-indexed line to start reading from" },
       "limit": { "type": "number", "description": "Max number of lines to read" }
     },
@@ -57,7 +57,7 @@ their own env flag, following the `TOOL_BASH_ENABLED` precedent.
     "type": "object",
     "properties": {
       "path": { "type": "string", "description":
-        "File path under the project root. Relative paths resolve under the project root; absolute paths must start with /repo/. Writes to .env, .git, or node_modules are rejected." },
+        "File path under /home/ubuntu. Relative paths resolve there; absolute paths must stay under /home/ubuntu. No filename class is blocked inside the allowed root." },
       "content": { "type": "string", "description": "Full file content (overwrites if the file exists)" }
     },
     "required": ["path", "content"]
@@ -70,7 +70,7 @@ their own env flag, following the `TOOL_BASH_ENABLED` precedent.
   "parameters": {
     "type": "object",
     "properties": {
-      "path": { "type": "string", "description": "File path under the project root (same rules as write_file)" },
+      "path": { "type": "string", "description": "File path under /home/ubuntu (same rules as write_file)" },
       "old_string": { "type": "string", "description": "Exact text to replace. Must match exactly once in the file." },
       "new_string": { "type": "string", "description": "Replacement text" }
     },
@@ -80,48 +80,43 @@ their own env flag, following the `TOOL_BASH_ENABLED` precedent.
 ```
 
 No `edits[]` array, no BOM/line-ending/Unicode-fuzzy-match handling (unlike
-pi-source's `edit.ts`) — `/work` files are worker-drafted scratch content, so
-a single exact old/new pair per call is enough.
+pi-source's `edit.ts`) — a single exact old/new pair per call is enough.
 
-## Jail + hard-rejects
+## Jail + host-access boundary
 
 Read and write/edit paths share `file-path-jail.ts`, both jailed to a single
-root — `REPO_ROOT`, `PathJailRoots { repoRoot }`:
+root — `/home/ubuntu`, represented as `PathJailRoots { root }`:
 
-- **Virtual-path convention**: `/repo/...` or a bare relative path →
-  `REPO_ROOT`. Any other absolute path — including `/work/...` — is rejected
-  before any I/O. There is no second root; the scratch workspace is bash-only
-  now (see "What" above).
-- **`..` traversal** is rejected as a literal path segment, before
-  resolution.
-- **Hard-reject patterns**: `.env`, `.git/`, `node_modules` — checked both on
-  the raw candidate path and again on the `realpath`-resolved path, so a
-  symlink can't launder past the string check. This is the control that
-  actually matters: the worker process owns `REPO_ROOT` (including `.env`)
-  outright, so filesystem permissions don't protect secrets from an
-  in-process read the way they'd protect them from the docker-sandboxed
-  `bash` tool.
-- **Symlink escape**: `resolveReadPath` and `resolveWritePath` both
-  `realpath` the nearest existing ancestor and verify it falls under
-  `REPO_ROOT`; a symlink planted in the repo pointing outside the jail is
-  rejected with "escapes the allowed root" rather than silently followed.
-- **`write_file`/`edit_file` can now write anywhere under the project root**
-  (still subject to the hard-reject patterns above) — there is no more
-  `/work`-only restriction, since `/work` is no longer addressable by these
-  tools at all.
+- **Virtual-path convention**: `/repo/...` or a bare relative path resolves
+  under `/home/ubuntu`. An absolute path must resolve inside `/home/ubuntu`.
+- **`..` traversal** is rejected as a literal path segment, before resolution.
+- **No filename-class denylist**: `.env`, `.git/`, `node_modules`, dotfiles,
+  credentials, and other paths inside `/home/ubuntu` are intentionally
+  accessible. The worker's in-process file APIs already run with the worker's
+  host privileges, and bash is explicitly unrestricted in this mode.
+- **Symlink escape**: `resolveReadPath` and `resolveWritePath` realpath the
+  target or nearest existing ancestor and verify it falls under
+  `/home/ubuntu`; a symlink pointing outside the home root is rejected.
+- **`write_file`/`edit_file` can write anywhere under `/home/ubuntu`**. The
+  remaining checks are only traversal and symlink containment; they are not an
+  OS-level security boundary because bash can use sudo and operate outside it.
 
+### Bash execution mode
+
+`bash.ts` runs commands as `ubuntu`, with `HOME=/home/ubuntu` and default cwd
+`/home/ubuntu`. This replaces the former `opc` privilege drop. On the reference
+host, `ubuntu` has passwordless sudo and Docker access, so a bash command can
+read or mutate the whole machine. This feature must only be enabled for a
+trusted single-user/operator deployment. The model is instructed to require an
+explicit user request for destructive or security-sensitive changes, but this
+is behavioral guidance rather than technical containment.
 ## Atomic writes
 
-`write_file`/`edit_file` now operate on `REPO_ROOT` directly instead of the
-docker-shared `WORKSPACE_DIR`, so the original uid-mismatch scenario this
-mechanism was built for (the `bash` container, uid 1000, creating files in
-`/work` that the worker's own uid can only group-read) no longer applies to
-these tools — `REPO_ROOT` is mounted **read-only** into that container
-(`bash.ts`'s `-v ${REPO_ROOT}:/repo:ro`), so the container never writes there
-at all. The temp-file-then-rename approach is kept anyway as general
-robustness: it avoids partial writes on failure and still degrades gracefully
-if a target file ever ends up non-writable by the worker for some other
-reason (e.g. mode bits left over from a prior process).
+`write_file`/`edit_file` operate directly on `/home/ubuntu`. The former
+uid-mismatch scenario that motivated the atomic-write implementation is no
+longer relevant to a separate sandbox: bash now runs as the same `ubuntu`
+account, while the temp-file-then-rename approach remains useful general
+robustness against partial writes and non-writable target file modes.
 
 Mechanism (`packages/worker/src/tools/atomic-write.ts`, used by both `write_file`
 and `edit_file`): write content to a temp file in the **same directory**
@@ -138,15 +133,16 @@ unlinked before the error propagates.
 re-enters the conversation as a `role: "tool"` message:
 
 ```
-<file path="/repo/notes.txt" lines="1-50">
+<file path="/home/ubuntu/notes.txt" lines="1-50">
 ...content...
 </file>
 ```
 
-This mitigates prompt injection: a file under the project root could contain
+This mitigates prompt injection: a file under the home root could contain
 text engineered to look like tool-call instructions (e.g. planted by an
 earlier, less-trusted turn). The delimiter is a hint to the model, not a security
-boundary — the path jail above is the actual control. Continuation-hint
+boundary — the path jail above is only a structural containment check. Bash is
+unrestricted in this deployment. Continuation-hint
 suffixes (`[Showing lines X-Y of Z. Use offset=N to continue.]`) are tool
 metadata, not file content, and are kept **outside** the `<file>` block.
 
@@ -169,15 +165,11 @@ call.
 `write-file-tool.test.ts`, `edit-file-tool.test.ts` (real temp-directory
 fixtures, no docker fake needed since these tools don't spawn a subprocess):
 
-- Relative/`/repo/` path resolution under the single project-root fixture.
-- `/work/...` rejected for both read and write/edit — it's outside the root
-  now, not a second valid zone.
-- `.env`, `.git/`, `node_modules` rejected even under `/repo` (the
-  highest-priority regression test in this feature — it stays a positive
-  "reject a secret path under the tools' own writable root" case now that
-  `/repo` is writable).
-- Writing/editing under an explicit `/repo/...` path succeeds (positive test
-  — this is new capability now that there's only one root).
+- Relative and `/repo/` path resolution under the single allowed-root fixture.
+- `/work/...` and other absolute paths outside the root are rejected.
+- `.env`, `.git/`, and `node_modules` inside the allowed root are readable and
+  writable, proving there is no filename denylist.
+- Writing/editing under an explicit `/repo/...` path succeeds as a legacy alias.
 - `..` traversal rejected.
 - Symlink escape rejected via `realpath`.
 - `read_file`: offset/limit pagination, truncation + continuation hint,
@@ -192,7 +184,7 @@ fixtures, no docker fake needed since these tools don't spawn a subprocess):
 - `edit_file`: zero matches → "not found"; multiple matches → "ambiguous";
   confirmation message includes the old/new diff lines.
 
-`npm test -w packages/worker` — 66 tests passing.
+Run the worker tests with `npm test -w packages/worker`.
 
 ## Rollout
 
@@ -231,11 +223,11 @@ free." The implementation instead runs all three tools in-process:
   does the same `realpath`-and-verify check `resolveReadPath` already needs
   for `read_file` — one jail implementation shared by all three tools
   instead of two different containment strategies.
-- Everything else in the analysis doc (schemas, hard-reject list, edit
-  uniqueness requirement, limits, no `apply_diff` tool) carried through
-  unchanged into the implementation.
+- The schemas, edit uniqueness requirement, limits, and lack of an `apply_diff`
+  tool carried through unchanged. The former hard-reject filename list was
+  deliberately removed when access expanded to the whole home tree.
 
-**Later change:** the two-zone `/work` + `/repo` model above was replaced
-with a single root, `REPO_ROOT`, pi-style — see "Jail + hard-rejects". The
-scratch workspace (`/work`) is now exclusively addressed through the `bash`
-tool; `read_file`/`write_file`/`edit_file` no longer know it exists.
+**Later change:** the former repo-only model was replaced with a whole-home
+root, `/home/ubuntu`, and unrestricted host bash — see "Jail + host-access
+boundary" and "Bash execution mode". The `/repo` spelling is retained only as
+a compatibility alias.

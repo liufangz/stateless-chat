@@ -1,6 +1,6 @@
 import { promises as fs } from "node:fs";
 import type { Tool } from "../tool-loop.js";
-import { REPO_ROOT } from "./bash.js";
+import { HOME_ROOT } from "./bash.js";
 import { resolveReadPath, type PathJailRoots } from "./file-path-jail.js";
 
 const MAX_LINES = 200;
@@ -42,13 +42,14 @@ export interface ReadFileToolOptions {
 }
 
 export function createReadFileTool(options?: ReadFileToolOptions): Tool {
-  const roots = options?.roots ?? { repoRoot: REPO_ROOT };
+  const roots = options?.roots ?? { root: HOME_ROOT };
 
   return {
     name: "read_file",
     description:
-      `Read a text file's contents. Output is truncated to ${MAX_LINES} lines or ${MAX_CHARS} chars, ` +
-      "whichever is hit first. Use offset/limit to page through a large file.",
+      `Read any text file under /home/ubuntu. Output is truncated to ${MAX_LINES} lines or ${MAX_CHARS} chars, ` +
+      "whichever is hit first. Use offset/limit to page through a large file. Dotfiles, credentials, " +
+      "repository metadata, and files in any project are accessible in full-host mode.",
     readOnly: true,
     parameters: {
       type: "object",
@@ -56,8 +57,8 @@ export function createReadFileTool(options?: ReadFileToolOptions): Tool {
         path: {
           type: "string",
           description:
-            "File path. Relative paths resolve under the project root; absolute paths under the " +
-            "project root (or the /repo/ sandbox alias) are also accepted.",
+            "File path. Relative paths resolve under /home/ubuntu; absolute paths under /home/ubuntu " +
+            "are accepted. /repo/... is a legacy alias for /home/ubuntu/....",
         },
         offset: { type: "number", description: "1-indexed line to start reading from" },
         limit: { type: "number", description: "Max number of lines to read" },

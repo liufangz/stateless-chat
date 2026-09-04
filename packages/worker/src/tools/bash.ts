@@ -5,10 +5,14 @@ import type { Tool } from "../tool-loop.js";
 const OUTPUT_LIMIT = 4000;
 const TRUNCATION_SUFFIX = "\n...[output truncated]";
 const DEFAULT_TIMEOUT_MS = 20_000;
-const EXEC_USER = "opc";
+// Full-host mode: run the shell as the normal host account rather than the
+// former downgraded `opc` account. On this machine `ubuntu` has passwordless
+// sudo and docker access, so this is intentionally not a sandbox.
+const EXEC_USER = "ubuntu";
 
+export const HOME_ROOT = "/home/ubuntu";
 export const REPO_ROOT = "/home/ubuntu/stateless-chat";
-export const DEFAULT_CWD = "/home/ubuntu";
+export const DEFAULT_CWD = HOME_ROOT;
 
 export interface SpawnResult {
   stdout: string;
@@ -18,11 +22,10 @@ export interface SpawnResult {
 export type SpawnFn = (args: string[], input: string) => Promise<SpawnResult>;
 
 /**
- * Pure — returns the exact `sudo` argv used to run the command as uid 1000
- * (opc, a non-sudo user) on the host. Tests assert this array directly so the
- * privilege-drop (-u opc) and the isolated PATH/HOME can't be silently
- * dropped. nodeBinDir is prepended to PATH so `node`/`npm`/`npx` resolve for
- * opc even though it doesn't own the worker's node install.
+ * Pure — returns the exact `sudo` argv used to run the command as ubuntu on
+ * the host. Tests assert this array directly so the execution identity and
+ * HOME cannot be silently changed. nodeBinDir is prepended to PATH so
+ * `node`/`npm`/`npx` resolve even if the worker uses a different Node install.
  */
 export function buildBashExecArgs(
   nodeBinDir: string = path.dirname(process.execPath)
@@ -33,7 +36,7 @@ export function buildBashExecArgs(
     EXEC_USER,
     "--",
     "env",
-    "HOME=/tmp",
+    `HOME=${HOME_ROOT}`,
     `PATH=${nodeBinDir}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`,
     "bash",
     "-s",
@@ -106,8 +109,9 @@ export function createBashTool(options?: {
   return {
     name: "bash",
     description:
-      "Run a shell command on the host as a non-privileged user (uid 1000). " +
-      "Default cwd: /home/ubuntu (all projects readable, only the repo writable).",
+      "Run an unrestricted shell command on the host as ubuntu. This is NOT a sandbox: " +
+      "ubuntu has passwordless sudo/docker access and commands may read or modify the " +
+      "entire machine, not just /home/ubuntu. Default cwd and HOME: /home/ubuntu.",
     parameters: {
       type: "object",
       properties: {

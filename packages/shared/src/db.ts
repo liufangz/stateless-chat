@@ -23,6 +23,15 @@ CREATE TABLE IF NOT EXISTS conversations (
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Auto-generated sidebar title (nullable/additive): set once by the worker
+-- after a turn completes, from an LLM summarization of that turn. Left NULL
+-- until it succeeds - the sidebar falls back to the last-message snippet
+-- until then, and setConversationTitle's "WHERE title IS NULL" guard means a
+-- conversation that hasn't gotten one yet (new or pre-existing) just retries
+-- on its next completed turn, with no separate failure-recovery mechanism
+-- needed.
+ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT;
+
 CREATE TABLE IF NOT EXISTS messages (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   conversation_id UUID NOT NULL REFERENCES conversations(id),
@@ -159,6 +168,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_tool_request_unique
 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_final_reply_unique
   ON messages (reply_to_message_id)
   WHERE role = 'assistant' AND tool_calls IS NULL;
+
+-- Cross-process coordination for the mutating file tools (write_file /
+-- edit_file): one row per canonicalized ("jailed", symlink-resolved) target
+-- path. Fenced by owner_token so only the attempt that acquired a lock can
+-- renew or release it, and bounded by expires_at (a TTL, same lease shape as
+-- messages.lease_expires_at above) so a crashed worker's lock is reclaimable
+-- without operator action instead of permanently blocking that path. See
+-- packages/worker/src/tools/file-lock.ts for the acquire/renew/release
+-- helpers and the bounded-wait-with-backoff caller that wraps a tool call.
+CREATE TABLE IF NOT EXISTS file_locks (
+  lock_key TEXT PRIMARY KEY,
+  owner_token TEXT NOT NULL,
+  acquired_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  expires_at TIMESTAMPTZ NOT NULL
+);
 `;
 
 export async function initSchema(pool: pg.Pool): Promise<void> {
@@ -188,11 +212,39 @@ export async function getConversation(
 }
 
 /**
+ * Sets a conversation's auto-generated title, but only if it doesn't already
+ * have one - so a slow/retried title generation from an earlier turn can
+ * never clobber one a later turn already committed, and this is safely
+ * callable on every completed turn of a conversation without regenerating
+ * (or overwriting a future manually-set title) once it succeeds once.
+ */
+export async function setConversationTitle(
+  pool: pg.Pool,
+  conversationId: string,
+  title: string
+): Promise<void> {
+  await pool.query(
+    `UPDATE conversations SET title = $2 WHERE id = $1 AND title IS NULL`,
+    [conversationId, title]
+  );
+}
+
+/**
  * Lists conversations most-recently-active first. "Active" means the most
  * recent message in the conversation, falling back to the conversation's
  * own created_at when it has no messages yet. The last message's content
  * comes along for free via the lateral join so the sidebar has a snippet
  * without a second round trip per conversation.
+ *
+ * Also surfaces the conversation's outstanding turn, if any, via a second
+ * lateral join keyed on the 'user' row's OWN status - not "is the most
+ * recent row overall a user row", which is unreliable once a turn has
+ * issued at least one tool call (the tool-call-request row, itself
+ * role='assistant', becomes the most recent row while the turn is still
+ * very much in progress). This is what lets the frontend discover every
+ * conversation with a turn still pending/processing/failed - and reconnect
+ * its stream, or surface its failure - straight from one conversation-list
+ * fetch, without loading each conversation's full history first.
  */
 export async function listConversations(
   pool: pg.Pool,
@@ -203,9 +255,13 @@ export async function listConversations(
        c.id,
        c.client_id,
        c.created_at,
+       c.title,
        COALESCE(m.created_at, c.created_at) AS updated_at,
        m.content AS last_message,
-       m.role AS last_message_role
+       m.role AS last_message_role,
+       outstanding.id AS outstanding_message_id,
+       outstanding.status AS outstanding_status,
+       outstanding.last_error AS outstanding_last_error
      FROM conversations c
      LEFT JOIN LATERAL (
        SELECT content, role, created_at
@@ -214,6 +270,15 @@ export async function listConversations(
        ORDER BY created_at DESC
        LIMIT 1
      ) m ON true
+     LEFT JOIN LATERAL (
+       SELECT id, status, last_error
+       FROM messages
+       WHERE messages.conversation_id = c.id
+         AND messages.role = 'user'
+         AND messages.status IN ('pending', 'processing', 'failed')
+       ORDER BY created_at DESC
+       LIMIT 1
+     ) outstanding ON true
      WHERE $1::text IS NULL OR c.client_id = $1
      ORDER BY updated_at DESC`,
     [clientId ?? null]
@@ -341,6 +406,40 @@ export async function sweepExhaustedLeases(
  * across workers, for both fresh claims and reclaims. Call
  * sweepExhaustedLeases first so rows that already exceeded maxAttempts are
  * failed out instead of reclaimed indefinitely.
+ *
+ * Conversation-level ordering gate (on top of the row-level claim above):
+ * a candidate row is skipped if its conversation already has ANOTHER 'user'
+ * row genuinely 'processing' (a live lease, or a legacy row with no lease at
+ * all) - this is what stops two different workers from claiming two
+ * different pending rows of the SAME conversation at the same time and each
+ * generating a reply from history that doesn't yet include the other's
+ * still-in-flight turn. It is deliberately narrow: it does not touch
+ * reclaiming a row whose OWN lease has expired (that's still the normal
+ * crash-recovery path above), and it says nothing about different
+ * conversations, which continue to claim fully in parallel.
+ *
+ * The `NOT EXISTS` check alone would still race across two concurrent
+ * `claimPendingMessages` calls (each is its own statement/transaction, so
+ * neither sees the other's not-yet-committed claim) - that race is closed by
+ * `pg_try_advisory_xact_lock(conversation_id)`: the first statement to reach
+ * a given conversation's candidate row wins that transaction-scoped
+ * advisory lock and proceeds; a concurrent statement racing for the SAME
+ * conversation fails the try-lock (returns false, non-blocking) and simply
+ * skips that candidate this pass, trying again next poll. The lock is
+ * released automatically when the (single-statement, autocommit) UPDATE's
+ * implicit transaction ends, so nothing here can leak across poll cycles.
+ * `hashtext(...)` collisions only ever make two unrelated conversations
+ * serialize against each other unnecessarily on rare, transient overlap -
+ * never a correctness issue, since it can only add serialization, never
+ * remove it.
+ *
+ * Known limitation: this guard is applied per candidate row within one
+ * statement's snapshot - Postgres advisory locks are re-entrant within a
+ * single transaction, so a single call with `limit > 1` could still claim
+ * two pending rows from the same conversation in one pass if neither is yet
+ * 'processing' at evaluation time. The worker always calls this with
+ * limit=1 (packages/worker/src/index.ts), so this is not reachable in
+ * practice; do not raise the limit without addressing this.
  */
 export async function claimPendingMessages(
   pool: pg.Pool,
@@ -356,12 +455,22 @@ export async function claimPendingMessages(
          attempt_count = attempt_count + 1,
          last_error = NULL
      WHERE id IN (
-       SELECT id FROM messages
-       WHERE role = 'user' AND (
-         status = 'pending'
-         OR (status = 'processing' AND (lease_expires_at IS NULL OR lease_expires_at < now()))
+       SELECT m.id
+       FROM messages m
+       WHERE m.role = 'user' AND (
+         m.status = 'pending'
+         OR (m.status = 'processing' AND (m.lease_expires_at IS NULL OR m.lease_expires_at < now()))
        )
-       ORDER BY created_at ASC
+       AND pg_try_advisory_xact_lock(hashtext(m.conversation_id::text)::bigint)
+       AND NOT EXISTS (
+         SELECT 1 FROM messages other
+         WHERE other.conversation_id = m.conversation_id
+           AND other.id <> m.id
+           AND other.role = 'user'
+           AND other.status = 'processing'
+           AND (other.lease_expires_at IS NULL OR other.lease_expires_at >= now())
+       )
+       ORDER BY m.created_at ASC
        LIMIT $1
        FOR UPDATE SKIP LOCKED
      )
@@ -469,16 +578,41 @@ export async function requeueMessageForRetry(
   return (rowCount ?? 0) > 0;
 }
 
+export type DeleteConversationOutcome = "deleted" | "not_found" | "in_progress";
+
 /**
  * Deletes a conversation and all of its messages. Scoped by clientId when
- * provided so a client can't delete a conversation it doesn't own. Returns
- * true if a conversation was actually deleted.
+ * provided so a client can't delete a conversation it doesn't own.
+ *
+ * Refuses to delete - returns "in_progress", nothing touched - while any of
+ * the conversation's turns is genuinely being processed (a 'processing' row
+ * with a live, non-expired lease). A worker holds an in-memory reference to
+ * that row and will keep trying to persist against it as the turn
+ * continues; deleting the conversation/message rows out from under it would
+ * make its later INSERTs (tool-call requests, tool results, the final
+ * reply) violate their foreign keys to a conversation/message that no
+ * longer exists - a real, deterministic failure mode, not a hypothetical
+ * one, given `conversation_id`/`reply_to_message_id` are both `REFERENCES`.
+ * An already-'processing' row whose lease has EXPIRED (an abandoned/crashed
+ * turn - see claimPendingMessages) does not block deletion; no worker holds
+ * a live reference to it.
+ *
+ * The check locks every candidate row (`FOR UPDATE`, still pending or still
+ * processing) for the duration of this transaction, so a `claimPendingMessages`
+ * call racing to promote one of this conversation's 'pending' rows to
+ * 'processing' at the same moment is serialized against this transaction
+ * instead of slipping through between the check and the delete: it either
+ * blocks until this transaction ends (rows gone -> nothing left to claim,
+ * or rolled back -> the claim proceeds normally against the still-present
+ * rows). Whether a row is "live" is computed in SQL against Postgres's own
+ * `now()`, not fetched and compared in JS, to avoid any client/server clock
+ * or driver date-parsing discrepancy.
  */
 export async function deleteConversation(
   pool: pg.Pool,
   conversationId: string,
   clientId?: string
-): Promise<boolean> {
+): Promise<DeleteConversationOutcome> {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
@@ -489,8 +623,21 @@ export async function deleteConversation(
     );
     if (rows.length === 0) {
       await client.query("ROLLBACK");
-      return false;
+      return "not_found";
     }
+
+    const { rows: claimableRows } = await client.query<{ is_live: boolean }>(
+      `SELECT (status = 'processing' AND (lease_expires_at IS NULL OR lease_expires_at >= now())) AS is_live
+       FROM messages
+       WHERE conversation_id = $1 AND role = 'user' AND status IN ('pending', 'processing')
+       FOR UPDATE`,
+      [conversationId]
+    );
+    if (claimableRows.some((r) => r.is_live)) {
+      await client.query("ROLLBACK");
+      return "in_progress";
+    }
+
     await client.query(`DELETE FROM messages WHERE conversation_id = $1`, [
       conversationId,
     ]);
@@ -498,7 +645,7 @@ export async function deleteConversation(
       conversationId,
     ]);
     await client.query("COMMIT");
-    return true;
+    return "deleted";
   } catch (err) {
     await client.query("ROLLBACK");
     throw err;
@@ -749,4 +896,73 @@ export async function getCompactionsForConversation(
     [conversationId]
   );
   return rows;
+}
+
+// --- Cross-process file lock (mutating file tools) --------------------------
+// One row per canonicalized target path (packages/worker/src/tools/file-lock.ts
+// derives `lockKey`), fenced by a per-attempt `ownerToken` so only the
+// acquirer can renew/release, with a TTL so a crashed worker's lock expires
+// instead of blocking that path forever. See file-lock.ts's `withFileLock`
+// for the bounded-wait-with-backoff caller built on these three primitives.
+
+/**
+ * Attempts to acquire the lock in one atomic statement: a fresh row always
+ * succeeds; a row already held by a live (non-expired) owner fails (returns
+ * false, no wait); a row whose lease has expired is reassigned to the new
+ * owner exactly like an expired message lease is reclaimed. The `WHERE`
+ * clause on the `DO UPDATE` is what makes "steal an expired lock" atomic
+ * with "notice the lock is expired" - there's no separate read-then-write
+ * window for a second acquirer to race into.
+ */
+export async function acquireFileLock(
+  pool: pg.Pool,
+  lockKey: string,
+  ownerToken: string,
+  leaseDurationMs: number
+): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `INSERT INTO file_locks (lock_key, owner_token, acquired_at, expires_at)
+     VALUES ($1, $2, now(), now() + make_interval(secs => $3::double precision / 1000))
+     ON CONFLICT (lock_key) DO UPDATE
+       SET owner_token = EXCLUDED.owner_token,
+           acquired_at = now(),
+           expires_at = EXCLUDED.expires_at
+       WHERE file_locks.expires_at < now()`,
+    [lockKey, ownerToken, leaseDurationMs]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Extends a held lock's expiry, guarded by ownerToken so a lock already
+ * reclaimed by someone else (this owner's lease lapsed) can't be resurrected
+ * - same shape as renewLease's worker_id guard for message processing.
+ */
+export async function renewFileLock(
+  pool: pg.Pool,
+  lockKey: string,
+  ownerToken: string,
+  leaseDurationMs: number
+): Promise<boolean> {
+  const { rowCount } = await pool.query(
+    `UPDATE file_locks
+     SET expires_at = now() + make_interval(secs => $3::double precision / 1000)
+     WHERE lock_key = $1 AND owner_token = $2`,
+    [lockKey, ownerToken, leaseDurationMs]
+  );
+  return (rowCount ?? 0) > 0;
+}
+
+/**
+ * Releases a held lock, guarded by ownerToken - a release call from an owner
+ * that no longer holds the lock (already reclaimed, or already released) is
+ * simply a no-op, never an error and never able to delete someone else's
+ * live lock.
+ */
+export async function releaseFileLock(
+  pool: pg.Pool,
+  lockKey: string,
+  ownerToken: string
+): Promise<void> {
+  await pool.query(`DELETE FROM file_locks WHERE lock_key = $1 AND owner_token = $2`, [lockKey, ownerToken]);
 }

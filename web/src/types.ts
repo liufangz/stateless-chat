@@ -80,4 +80,13 @@ export interface ConversationSummary {
   updated_at: string;
   last_message: string | null;
   last_message_role: Role | null;
+  title: string | null;
+  // Outstanding-turn discovery (multi-conversation resume): the most recent
+  // 'user' row in this conversation whose own status is still
+  // pending/processing/failed, if any - null once every turn has a final
+  // reply. Lets the app find and reconnect every conversation with a turn in
+  // flight from one conversation-list fetch, not just the selected one.
+  outstanding_message_id: string | null;
+  outstanding_status: 'pending' | 'processing' | 'failed' | null;
+  outstanding_last_error: string | null;
 }

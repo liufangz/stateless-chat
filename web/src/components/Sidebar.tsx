@@ -9,7 +9,6 @@ interface SidebarProps {
   conversations: ConversationSummary[];
   currentId: string | null;
   loading: boolean;
-  disabled: boolean;
   collapsed: boolean;
   mobileOpen: boolean;
   onSelect: (id: string) => void;
@@ -28,7 +27,7 @@ function formatTimestamp(iso: string): string {
     : date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-export function Sidebar({ conversations, currentId, loading, disabled, collapsed, mobileOpen, onSelect, onNewChat, onDelete, onLogout, onMobileClose }: SidebarProps) {
+export function Sidebar({ conversations, currentId, loading, collapsed, mobileOpen, onSelect, onNewChat, onDelete, onLogout, onMobileClose }: SidebarProps) {
   const [confirmingId, setConfirmingId] = useState<string | null>(null);
   const isMobile = useMediaQuery('(max-width: 639.98px)');
   const hidden = isMobile ? !mobileOpen : collapsed;
@@ -92,8 +91,7 @@ export function Sidebar({ conversations, currentId, loading, disabled, collapsed
           <button
             type="button"
             onClick={onNewChat}
-            disabled={disabled}
-            className="w-full rounded-lg bg-indigo-600 px-3 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-300 sm:py-2"
+            className="w-full rounded-lg bg-indigo-600 px-3 py-2.5 text-sm font-medium text-white transition hover:bg-indigo-700 sm:py-2"
           >
             + New chat
           </button>
@@ -111,9 +109,11 @@ export function Sidebar({ conversations, currentId, loading, disabled, collapsed
           {conversations.map((conversation) => {
             const isActive = conversation.id === currentId;
             const isConfirming = confirmingId === conversation.id;
-            const snippet = conversation.last_message
-              ? `${conversation.last_message_role === 'assistant' ? 'AI: ' : ''}${conversation.last_message}`
-              : 'New conversation';
+            const snippet =
+              conversation.title ??
+              (conversation.last_message
+                ? `${conversation.last_message_role === 'assistant' ? 'AI: ' : ''}${conversation.last_message}`
+                : 'New conversation');
 
             return (
               <div
@@ -131,11 +131,20 @@ export function Sidebar({ conversations, currentId, loading, disabled, collapsed
                   onContextMenu={(e) => {
                     if (isMobile) e.preventDefault();
                   }}
-                  disabled={disabled}
-                  className="block w-full select-none px-3 py-2.5 pr-9 text-left transition disabled:cursor-not-allowed"
+                  className="block w-full select-none px-3 py-2.5 pr-9 text-left transition"
                 >
-                  <div className={`truncate text-sm ${isActive ? 'font-medium text-indigo-700' : 'text-slate-700'}`}>
-                    {snippet}
+                  <div className={`flex items-center gap-1.5 truncate text-sm ${isActive ? 'font-medium text-indigo-700' : 'text-slate-700'}`}>
+                    <span className="truncate">{snippet}</span>
+                    {(conversation.outstanding_status === 'pending' || conversation.outstanding_status === 'processing') && (
+                      <span
+                        aria-label="Reply in progress"
+                        title="Reply in progress"
+                        className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-indigo-500"
+                      />
+                    )}
+                    {conversation.outstanding_status === 'failed' && (
+                      <span aria-label="Reply failed" title="Reply failed" className="h-1.5 w-1.5 shrink-0 rounded-full bg-red-500" />
+                    )}
                   </div>
                   <div className="mt-0.5 text-xs text-slate-400">{formatTimestamp(conversation.updated_at)}</div>
                 </button>
@@ -144,7 +153,6 @@ export function Sidebar({ conversations, currentId, loading, disabled, collapsed
                   <button
                     type="button"
                     aria-label="Delete conversation"
-                    disabled={disabled}
                     onClick={(e) => {
                       e.stopPropagation();
                       setConfirmingId(conversation.id);

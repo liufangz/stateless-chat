@@ -14,7 +14,8 @@ export { BASH_TOOL, createBashTool, buildBashExecArgs, runBash } from "./bash.js
 export { READ_FILE_TOOL, createReadFileTool } from "./read-file.js";
 export { WRITE_FILE_TOOL, createWriteFileTool } from "./write-file.js";
 export { EDIT_FILE_TOOL, createEditFileTool } from "./edit-file.js";
-export { resolveReadPath, resolveWritePath, type PathJailRoots } from "./file-path-jail.js";
+export { resolveReadPath, resolveWritePath, canonicalLockKey, type PathJailRoots } from "./file-path-jail.js";
+export { createPostgresFileLock, withFileLock, type FileLock } from "./file-lock.js";
 export { SUBAGENT_TOOL_NAME, createSubagentTool } from "./subagent.js";
 
 /**

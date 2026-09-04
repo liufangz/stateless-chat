@@ -106,14 +106,20 @@ interface FakeTool {
   description: string;
   parameters: unknown;
   execute: (args: any) => Promise<string> | string;
+  parallelSafe?: boolean;
 }
 
-function makeTool(name: string, impl: (args: any) => string | Promise<string>): FakeTool {
+function makeTool(
+  name: string,
+  impl: (args: any) => string | Promise<string>,
+  opts: { parallelSafe?: boolean } = {}
+): FakeTool {
   return {
     name,
     description: `test tool ${name}`,
     parameters: { type: "object", properties: {} },
     execute: vi.fn(impl),
+    ...opts,
   };
 }
 
@@ -370,6 +376,77 @@ describe("runToolLoop", () => {
       isError: true,
     });
     expect(toolExchange[1].result).toMatch(/error/i);
+  });
+
+  it("h2) parallelSafe batch: independent calls run concurrently but persist/append in original order", async () => {
+    const delayMs = (n: number, tag: string) => (): Promise<string> =>
+      new Promise((resolve) => setTimeout(() => resolve(tag), n));
+    // slow finishes first (short delay), fast finishes last (long delay) -
+    // named the opposite of their delay so a passing order assertion can
+    // only be explained by "sorted by original call order", not by luck.
+    const slow = makeTool("slow", delayMs(5, "slow-result"), { parallelSafe: true });
+    const fast = makeTool("fast", delayMs(40, "fast-result"), { parallelSafe: true });
+
+    const { client } = createFakeClient([
+      [
+        toolCallStart(0, "call_1", "slow", "{}"),
+        toolCallStart(1, "call_2", "fast", "{}"),
+        finish("tool_calls"),
+      ],
+      [text("done"), finish("stop")],
+    ]);
+
+    const start = Date.now();
+    const { content, toolExchange } = await runToolLoop(makeHistory(), vi.fn(), undefined, {
+      client: client as any,
+      tools: [slow, fast] as any,
+    });
+    const elapsedMs = Date.now() - start;
+
+    expect(content).toBe("done");
+    // Both calls actually ran (40ms + a few ms of overhead) rather than
+    // sequentially (5ms + 40ms + overhead would still pass a loose bound,
+    // so assert well under the sequential sum instead of just "fast").
+    expect(elapsedMs).toBeLessThan(70);
+    // Results are appended in the model's original tool-call order (call_1
+    // then call_2) even though call_2 ("fast") resolves after call_1.
+    expect(toolExchange.map((r) => r.toolCallId)).toEqual(["call_1", "call_2"]);
+    expect(toolExchange[0]).toMatchObject({ toolCallId: "call_1", toolName: "slow", result: "slow-result" });
+    expect(toolExchange[1]).toMatchObject({ toolCallId: "call_2", toolName: "fast", result: "fast-result" });
+  });
+
+  it("h3) one non-parallelSafe call in the batch keeps the whole batch sequential", async () => {
+    const order: string[] = [];
+    const a = makeTool(
+      "a",
+      async () => {
+        order.push("a-start");
+        await new Promise((r) => setTimeout(r, 10));
+        order.push("a-end");
+        return "a-result";
+      },
+      { parallelSafe: true }
+    );
+    // No parallelSafe flag - conservative default, should force sequential
+    // execution of the whole batch even though `a` opts in.
+    const b = makeTool("b", async () => {
+      order.push("b-start");
+      order.push("b-end");
+      return "b-result";
+    });
+
+    const { client } = createFakeClient([
+      [toolCallStart(0, "call_1", "a", "{}"), toolCallStart(1, "call_2", "b", "{}"), finish("tool_calls")],
+      [text("done"), finish("stop")],
+    ]);
+
+    await runToolLoop(makeHistory(), vi.fn(), undefined, {
+      client: client as any,
+      tools: [a, b] as any,
+    });
+
+    // Sequential: "a" fully completes (start then end) before "b" starts.
+    expect(order).toEqual(["a-start", "a-end", "b-start", "b-end"]);
   });
 
   it("i) wall-clock deadline: loop exits gracefully mid-survey and answers via answer-now retry (no rejection)", async () => {

@@ -117,6 +117,19 @@ export interface Tool {
    * "not safe to retry", the conservative choice for an unknown tool.
    */
   readOnly?: boolean;
+  /**
+   * Whether this tool's execution is independent of every other tool call in
+   * the same iteration - no shared mutable state, no ordering requirement,
+   * safe to run concurrently with sibling calls. Used only to decide whether
+   * an iteration's batch of calls can run via Promise.allSettled instead of
+   * one at a time (see the parallelSafe check in runLoopBody); it says
+   * nothing about crash-recoverability, which is governed entirely by
+   * `readOnly` and unaffected by this flag. A batch is only run concurrently
+   * when EVERY call in it resolves to a parallelSafe tool - one unflagged
+   * (or unknown) tool in the batch keeps the whole batch sequential. Unset
+   * defaults to "not safe to parallelize", the conservative choice.
+   */
+  parallelSafe?: boolean;
 }
 
 export type ToolEvent =
@@ -316,6 +329,95 @@ export async function executeToolCall(
       isError: true,
     };
   }
+}
+
+interface ToolCallStepResult {
+  record: ToolExchangeRecord;
+  toolMsg: ChatMessage;
+}
+
+/**
+ * Runs one tool call end-to-end - beforeToolCall/afterToolCall hooks,
+ * execution, and all onToolEvent/lifecycle events - but deliberately does
+ * NOT persist the result or append it to `messages`/`toolExchange`. Split
+ * out of the main loop so a parallel-safe batch (every call resolves to a
+ * Tool with `parallelSafe: true`) can run these concurrently via
+ * Promise.allSettled while the caller still persists and appends results
+ * sequentially, in the model's original tool-call order - identical history
+ * shape and identical "check aborted before persisting" guard to the
+ * sequential path, just with the actual tool work overlapped.
+ */
+async function runToolCallStep(
+  iteration: number,
+  tc: AccumulatedToolCall,
+  toolsByName: Map<string, Tool>,
+  hooks: LifecycleHooks | undefined,
+  onToolEvent: ((event: ToolEvent) => void) | undefined,
+  lifecycle: Lifecycle | undefined
+): Promise<ToolCallStepResult> {
+  const args = tryParseArgsForEvent(tc.arguments);
+  onToolEvent?.({ type: "tool_start", toolCallId: tc.id, toolName: tc.name, args });
+  await lifecycle?.emit({ type: "tool_execution_start", toolCallId: tc.id, toolName: tc.name, args });
+
+  // pi-style beforeToolCall: veto the call or patch its arguments before
+  // execution. A veto fails the call without running it.
+  let execArgs: unknown = args;
+  let vetoed = false;
+  let vetoReason = "";
+  const before = await hooks?.beforeToolCall?.({ toolCallId: tc.id, toolName: tc.name, args });
+  if (before?.stop) {
+    vetoed = true;
+    vetoReason = before.reason ?? `tool call stopped by beforeToolCall hook`;
+  } else if (before?.args !== undefined) {
+    execArgs = before.args;
+  }
+
+  let result: ToolExecutionResult = vetoed
+    ? { content: `Error: ${vetoReason}`, isError: true }
+    : before?.args !== undefined
+      ? await executeToolCall({ ...tc, arguments: JSON.stringify(execArgs ?? {}) }, toolsByName)
+      : await executeToolCall(tc, toolsByName);
+
+  // pi-style afterToolCall: patch the result the model sees.
+  const after =
+    vetoed || result.isError
+      ? undefined
+      : await hooks?.afterToolCall?.({
+          toolCallId: tc.id,
+          toolName: tc.name,
+          args: execArgs,
+          result: result.content,
+          isError: result.isError,
+        });
+  if (after?.result !== undefined) {
+    result = { content: after.result, isError: result.isError };
+  }
+
+  onToolEvent?.({ type: "tool_end", toolCallId: tc.id, toolName: tc.name, isError: result.isError });
+  await lifecycle?.emit({
+    type: "tool_execution_end",
+    toolCallId: tc.id,
+    toolName: tc.name,
+    result: result.content,
+    isError: result.isError,
+  });
+  const lifecycleToolMsg: LifecycleMessage = { role: "tool", content: result.content, toolCallId: tc.id };
+  await lifecycle?.emit({ type: "message_start", message: lifecycleToolMsg });
+  await lifecycle?.emit({ type: "message_end", message: lifecycleToolMsg });
+
+  const record: ToolExchangeRecord = {
+    iteration,
+    toolCallId: tc.id,
+    toolName: tc.name,
+    arguments: tc.arguments,
+    args: execArgs,
+    result: result.content,
+    isError: result.isError,
+  };
+  return {
+    record,
+    toolMsg: { role: "tool", tool_call_id: tc.id, content: result.content },
+  };
 }
 
 // --- Turn-boundary-aware history slicing --------------------------------
@@ -904,86 +1006,58 @@ async function runLoopBody(
       continue;
     }
 
-    for (const tc of toolCalls) {
-      const args = tryParseArgsForEvent(tc.arguments);
-      onToolEvent?.({ type: "tool_start", toolCallId: tc.id, toolName: tc.name, args });
-      await lifecycle?.emit({ type: "tool_execution_start", toolCallId: tc.id, toolName: tc.name, args });
+    // Durable checkpoint #2: result persisted immediately after execution,
+    // before the next tool call executes or the next LLM continuation is
+    // requested. If a crash happens between a call's execution and this
+    // persisting, a mutating tool's side effect may have already happened
+    // with no durable record of it - see turn-recovery.ts, which is what
+    // has to reason about that window on the next claim. This applies
+    // identically whether the batch below ran sequentially or concurrently:
+    // parallelSafe only overlaps the execution work, never the persistence.
+    //
+    // A call's own execution is the other long single await a stuck tool
+    // (e.g. a hung bash command) can sit inside past the backstop - recheck
+    // `aborted` before writing anything, for the same reason as the check
+    // after the stream read.
+    const isParallelSafeBatch =
+      toolCalls.length > 1 &&
+      toolCalls.every((tc) => toolsByName.get(tc.name)?.parallelSafe === true);
 
-      // pi-style beforeToolCall: veto the call or patch its arguments
-      // before execution. A veto fails the call without running it.
-      let execArgs: unknown = args;
-      let vetoed = false;
-      let vetoReason = "";
-      const before = await hooks?.beforeToolCall?.({ toolCallId: tc.id, toolName: tc.name, args });
-      if (before?.stop) {
-        vetoed = true;
-        vetoReason = before.reason ?? `tool call stopped by beforeToolCall hook`;
-      } else if (before?.args !== undefined) {
-        execArgs = before.args;
+    if (isParallelSafeBatch) {
+      // Every call in this iteration is independent (e.g. sibling subagent
+      // delegations) - overlap their actual work via Promise.allSettled.
+      // Persistence and message-append still happen sequentially below, in
+      // the model's original call order, so history shape and the
+      // aborted-before-persisting guard are unchanged from the sequential
+      // path; only the wall-clock cost of running the calls is reduced.
+      const settled = await Promise.allSettled(
+        toolCalls.map((tc) => runToolCallStep(iteration, tc, toolsByName, hooks, onToolEvent, lifecycle))
+      );
+      const rejected = settled.find((s): s is PromiseRejectedResult => s.status === "rejected");
+      if (rejected) throw rejected.reason;
+      const steps = settled.map((s) => (s as PromiseFulfilledResult<ToolCallStepResult>).value);
+
+      for (const { record, toolMsg } of steps) {
+        if (aborted.value) return abortedResult();
+        await persistence?.onToolResult(record);
+        messages.push(toolMsg);
+        toolExchange.push(record);
       }
-
-      let result: ToolExecutionResult = vetoed
-        ? { content: `Error: ${vetoReason}`, isError: true }
-        : before?.args !== undefined
-          ? await executeToolCall({ ...tc, arguments: JSON.stringify(execArgs ?? {}) }, toolsByName)
-          : await executeToolCall(tc, toolsByName);
-
-      // pi-style afterToolCall: patch the result the model sees.
-      const after =
-        vetoed || result.isError
-          ? undefined
-          : await hooks?.afterToolCall?.({
-              toolCallId: tc.id,
-              toolName: tc.name,
-              args: execArgs,
-              result: result.content,
-              isError: result.isError,
-            });
-      if (after?.result !== undefined) {
-        result = { content: after.result, isError: result.isError };
+    } else {
+      for (const tc of toolCalls) {
+        const { record, toolMsg } = await runToolCallStep(
+          iteration,
+          tc,
+          toolsByName,
+          hooks,
+          onToolEvent,
+          lifecycle
+        );
+        if (aborted.value) return abortedResult();
+        await persistence?.onToolResult(record);
+        messages.push(toolMsg);
+        toolExchange.push(record);
       }
-
-      onToolEvent?.({
-        type: "tool_end",
-        toolCallId: tc.id,
-        toolName: tc.name,
-        isError: result.isError,
-      });
-      await lifecycle?.emit({
-        type: "tool_execution_end",
-        toolCallId: tc.id,
-        toolName: tc.name,
-        result: result.content,
-        isError: result.isError,
-      });
-      const toolMsg: LifecycleMessage = { role: "tool", content: result.content, toolCallId: tc.id };
-      await lifecycle?.emit({ type: "message_start", message: toolMsg });
-      await lifecycle?.emit({ type: "message_end", message: toolMsg });
-      const record: ToolExchangeRecord = {
-        iteration,
-        toolCallId: tc.id,
-        toolName: tc.name,
-        arguments: tc.arguments,
-        args: execArgs,
-        result: result.content,
-        isError: result.isError,
-      };
-      // Durable checkpoint #2: result persisted immediately after
-      // execution, before the next tool call executes or the next LLM
-      // continuation is requested. If a crash happens between
-      // executeToolCall returning and this persisting, a mutating tool's
-      // side effect may have already happened with no durable record of
-      // it - see turn-recovery.ts, which is what has to reason about that
-      // window on the next claim.
-      //
-      // executeToolCall above is the other long single await a stuck tool
-      // (e.g. a hung bash command) can sit inside past the backstop -
-      // recheck here before writing anything for the same reason as the
-      // check after the stream read.
-      if (aborted.value) return abortedResult();
-      await persistence?.onToolResult(record);
-      messages.push({ role: "tool", tool_call_id: tc.id, content: result.content });
-      toolExchange.push(record);
     }
   }
 

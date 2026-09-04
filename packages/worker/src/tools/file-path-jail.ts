@@ -1,26 +1,13 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
-// Hard-blocked regardless of anything else - secrets and repo internals must
-// never be readable/writable via these tools even if a traversal or symlink
-// check is somehow bypassed. Applied as a second, independent layer of
-// defense, not the primary jail mechanism.
-const HARD_REJECT_PATTERNS = [/(^|\/)\.env($|\/)/, /(^|\/)\.git($|\/)/, /(^|\/)node_modules($|\/)/];
-
 export interface PathJailRoots {
-  repoRoot: string;
+  /** The one filesystem root exposed to the file tools. */
+  root: string;
 }
 
 function hasTraversalSegment(rawPath: string): boolean {
   return rawPath.split("/").some((segment) => segment === "..");
-}
-
-function rejectIfHardBlocked(resolvedPath: string): void {
-  for (const pattern of HARD_REJECT_PATTERNS) {
-    if (pattern.test(resolvedPath)) {
-      throw new Error(`Access to '${resolvedPath}' is not allowed.`);
-    }
-  }
 }
 
 async function nearestExistingAncestor(target: string): Promise<string> {
@@ -61,10 +48,10 @@ function stripRepoAlias(rawPath: string): string | null {
 }
 
 /**
- * Map a tool-supplied path to a candidate under the repo root:
- *   - "/repo/..." (sandbox-era alias)  -> repoRoot + sub
+ * Map a tool-supplied path to a candidate under the allowed root:
+ *   - "/repo/..." (legacy alias)       -> root + sub
  *   - a real absolute path             -> itself (containment checked later)
- *   - a bare relative path             -> repoRoot + "/" + path
+ *   - a bare relative path             -> root + "/" + path
  */
 function resolveCandidate(rawPath: string, root: string): string {
   const alias = stripRepoAlias(rawPath);
@@ -75,10 +62,11 @@ function resolveCandidate(rawPath: string, root: string): string {
 
 /**
  * Resolve a tool-supplied read path ("/repo/...", a real absolute path under
- * the project root, or a bare relative path resolved under the project root)
- * to a real, existing, jailed file path. Throws on traversal, hard-blocked
- * names (.env/.git/node_modules), a missing file, an absolute path outside
- * the root, or a symlink that resolves outside the root.
+ * the allowed root, or a bare relative path resolved under the allowed root)
+ * to a real, existing, jailed file path. Throws on traversal, a missing file,
+ * an absolute path outside the root, or a symlink that resolves outside the
+ * root. Dotfiles, .env, .git, node_modules, and other paths inside the root
+ * are intentionally allowed in full-host mode.
  */
 export async function resolveReadPath(rawPath: string, roots: PathJailRoots): Promise<string> {
   if (typeof rawPath !== "string" || rawPath.trim() === "") {
@@ -88,9 +76,8 @@ export async function resolveReadPath(rawPath: string, roots: PathJailRoots): Pr
     throw new Error(`path must not contain '..' segments: ${rawPath}`);
   }
 
-  const root = roots.repoRoot;
+  const root = roots.root;
   const candidate = resolveCandidate(rawPath, root);
-  rejectIfHardBlocked(candidate);
 
   let realPath: string;
   try {
@@ -103,18 +90,17 @@ export async function resolveReadPath(rawPath: string, roots: PathJailRoots): Pr
   if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
     throw new Error(`Path escapes the allowed root: ${rawPath}`);
   }
-  rejectIfHardBlocked(realPath);
 
   return realPath;
 }
 
 /**
  * Resolve a tool-supplied write/edit path ("/repo/...", a real absolute path
- * under the project root, or a bare relative path) to an absolute path jailed
- * under the project root. The file need not exist yet - symlink escape is
+ * under the allowed root, or a bare relative path) to an absolute path jailed
+ * under the allowed root. The file need not exist yet - symlink escape is
  * checked against the nearest existing ancestor directory instead of the
- * (possibly not-yet-created) target itself. Throws on traversal, absolute
- * paths outside the root, or hard-blocked names.
+ * (possibly not-yet-created) target itself. Throws on traversal or absolute
+ * paths outside the root.
  */
 export async function resolveWritePath(rawPath: string, roots: PathJailRoots): Promise<string> {
   if (typeof rawPath !== "string" || rawPath.trim() === "") {
@@ -124,10 +110,38 @@ export async function resolveWritePath(rawPath: string, roots: PathJailRoots): P
     throw new Error(`path must not contain '..' segments: ${rawPath}`);
   }
 
-  const root = roots.repoRoot;
+  const root = roots.root;
   const candidate = resolveCandidate(rawPath, root);
-  rejectIfHardBlocked(candidate);
   await assertWithinRoot(candidate, root);
 
   return candidate;
+}
+
+/**
+ * Derives the cross-process file-lock identity for an already-jailed target
+ * path (the output of resolveWritePath, or resolveReadPath). Two different
+ * strings that name the SAME underlying file must produce the SAME key, or
+ * the lock provides no real mutual exclusion between them - so this always
+ * fully resolves symlinks, exactly like resolveReadPath already must for an
+ * existing file.
+ *
+ * A write/edit target need not exist yet (a brand-new file is a normal
+ * write_file call), so this can't simply `realpath()` the target itself -
+ * that throws ENOENT. Instead it mirrors assertWithinRoot's own strategy:
+ * realpath the nearest EXISTING ancestor directory and append the remaining,
+ * not-yet-existing path segments verbatim. This is deliberately the exact
+ * same canonicalization rule the path jail already uses (not a second,
+ * independently-written one), so the lock key for "/repo/new.txt" is stable
+ * across repeated calls whether or not the file exists yet, and converges
+ * with the file's own eventual realpath once it's created.
+ */
+export async function canonicalLockKey(targetPath: string): Promise<string> {
+  try {
+    return await fs.realpath(targetPath);
+  } catch {
+    const ancestor = await nearestExistingAncestor(targetPath);
+    const realAncestor = await fs.realpath(ancestor);
+    const suffix = path.relative(ancestor, targetPath);
+    return suffix ? path.join(realAncestor, suffix) : realAncestor;
+  }
 }

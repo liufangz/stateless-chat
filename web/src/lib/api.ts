@@ -73,9 +73,18 @@ export async function deleteConversation(conversationId: string, clientId: strin
   const res = await fetch(`${API_BASE}/conversations/${conversationId}?clientId=${encodeURIComponent(clientId)}`, {
     method: 'DELETE',
   });
-  if (!res.ok && res.status !== 404) {
-    throw new ApiError(res.status, `DELETE /conversations/${conversationId} failed: ${res.status}`);
+  if (res.ok || res.status === 404) return; // 404 = already gone, treat as a successful delete
+  // 409 = a reply is still in flight (deterministic conflict, not a race
+  // the client has to interpret) - surface the server's own clear message
+  // rather than a bare status code, same as login's error handling.
+  let message = `DELETE /conversations/${conversationId} failed: ${res.status}`;
+  try {
+    const body = await res.json();
+    if (typeof body?.error === 'string') message = body.error;
+  } catch {
+    // non-JSON error body, fall back to the default message
   }
+  throw new ApiError(res.status, message);
 }
 
 export function getHistory(
@@ -109,6 +118,22 @@ export interface StreamHandlers {
   onToolEnd?: (info: { toolCallId: string; toolName: string; isError: boolean }) => void;
 }
 
+/**
+ * Distinguishes a genuine server-sent `event: error` SSE message (a
+ * MessageEvent carrying a JSON payload - the gateway/worker's own signal
+ * that this turn failed, see packages/gateway/src/index.ts's `deliver()`)
+ * from the browser's native EventSource connection-failure event (a plain
+ * Event with no `data`, fired for network drops, server restarts, etc.).
+ * Both dispatch through the SAME `addEventListener('error', ...)` listener
+ * - EventSource does not reserve "error" as a name a server-sent event
+ * can't collide with - so without this check, a transient network blip
+ * would be indistinguishable from (and handled identically to) an actual
+ * worker-side turn failure.
+ */
+export function isServerSentErrorEvent(event: Event): event is MessageEvent {
+  return typeof (event as MessageEvent).data === 'string';
+}
+
 export function streamReply(streamUrl: string, handlers: StreamHandlers): () => void {
   const source = new EventSource(`${API_BASE}${streamUrl}`);
 
@@ -134,7 +159,25 @@ export function streamReply(streamUrl: string, handlers: StreamHandlers): () => 
   });
 
   source.addEventListener('error', (event) => {
-    const raw = (event as MessageEvent).data;
+    if (!isServerSentErrorEvent(event)) {
+      // A native connection failure, not a server-sent `event: error`
+      // message - the browser's EventSource retries this automatically on
+      // its own (per the SSE spec) unless it has fully given up
+      // (readyState CLOSED, e.g. after a non-retryable HTTP status or
+      // repeated failures). Do NOT close() here - that would permanently
+      // kill the built-in retry - and do not report a terminal failure for
+      // something that may still resolve on its own: the stream endpoint
+      // is safe to reconnect to at any point in a turn's lifecycle, so a
+      // resumed connection picks up right where it left off (durably
+      // persisted tool progress is replayed, and a since-finished reply is
+      // read back from Postgres instead of requiring the live stream at
+      // all - see the gateway's stream handler).
+      if (source.readyState === EventSource.CLOSED) {
+        handlers.onError('Lost connection to the server and could not reconnect.');
+      }
+      return;
+    }
+    const raw = event.data;
     let message = 'Stream error';
     if (raw) {
       try {

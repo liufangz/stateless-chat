@@ -14,10 +14,10 @@ describe("buildBashExecArgs", () => {
     expect(args).toEqual([
       "-n",
       "-u",
-      "opc",
+      "ubuntu",
       "--",
       "env",
-      "HOME=/tmp",
+      "HOME=/home/ubuntu",
       "PATH=/opt/node/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
       "bash",
       "-s",
@@ -26,7 +26,7 @@ describe("buildBashExecArgs", () => {
 
   it("defaults nodeBinDir to the dirname of process.execPath", () => {
     const args = buildBashExecArgs();
-    for (const flag of ["-n", "-u", "opc", "--", "env", "HOME=/tmp", "bash", "-s"]) {
+    for (const flag of ["-n", "-u", "ubuntu", "--", "env", "HOME=/home/ubuntu", "bash", "-s"]) {
       expect(args).toContain(flag);
     }
     const pathArg = args.find((a) => a.startsWith("PATH="));

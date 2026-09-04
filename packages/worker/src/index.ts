@@ -3,6 +3,7 @@ import {
   env,
   createPool,
   claimPendingMessages,
+  getConversation,
   getConversationHistory,
   getLatestCompaction,
   insertAssistantMessage,
@@ -12,6 +13,7 @@ import {
   markMessageDone,
   markMessageFailed,
   renewLease,
+  setConversationTitle,
   stillOwnsLease,
   sweepExhaustedLeases,
   createRedisClient,
@@ -21,6 +23,7 @@ import {
   estimateHistoricalContextTokens,
 } from "@stateless-chat/shared";
 import type { Message } from "@stateless-chat/shared";
+import { generateTitle } from "./llm.js";
 import { runToolLoop, DEFAULT_TOOLS } from "./tool-loop.js";
 import type { CompactionEntry, ToolEvent } from "./tool-loop.js";
 import { Lifecycle, createLoggingHooks } from "./lifecycle.js";
@@ -38,6 +41,36 @@ let shuttingDown = false;
 // Tracks turns currently in flight so a graceful shutdown can wait for them
 // (up to env.drainTimeoutMs) instead of killing them outright.
 const inFlight = new Set<Promise<void>>();
+
+/**
+ * Auto-titling: after any completed turn, if the conversation doesn't have a
+ * title yet, summarize this turn's exchange into a short one and persist it.
+ * Runs before markMessageDone/publishing "done" so a client's post-done
+ * conversation-list refresh already sees it - the gateway's SSE handler
+ * closes the stream right on "done" (see packages/gateway/src/index.ts), so
+ * anything published after that would have no listener left to reach.
+ *
+ * Deliberately has no dedicated failure-recovery mechanism: a failure here
+ * (model error, empty completion, etc.) just leaves the conversation
+ * untitled, and setConversationTitle's "WHERE title IS NULL" guard means the
+ * very next completed turn (new conversation or pre-existing one) retries
+ * this for free. Never let a titling failure fail the turn itself.
+ */
+async function maybeGenerateTitle(
+  conversationId: string,
+  userContent: string,
+  assistantContent: string,
+  log: (...args: unknown[]) => void
+): Promise<void> {
+  try {
+    const conversation = await getConversation(pool, conversationId);
+    if (!conversation || conversation.title) return;
+    const title = await generateTitle(userContent, assistantContent);
+    if (title) await setConversationTitle(pool, conversationId, title);
+  } catch (err) {
+    log("title generation failed (non-fatal, will retry on a later turn)", err);
+  }
+}
 
 async function processMessage(message: Message) {
   const log = (...args: unknown[]) =>
@@ -126,6 +159,7 @@ async function processMessage(message: Message) {
       agentMessages.push(recoveredMsg);
       await lifecycle.emit({ type: "message_start", message: recoveredMsg });
       await lifecycle.emit({ type: "message_end", message: recoveredMsg });
+      await maybeGenerateTitle(message.conversation_id, message.content ?? "", reply.content, log);
       await markMessageDone(pool, message.id);
       await publisher.publish(
         channel,
@@ -275,6 +309,7 @@ async function processMessage(message: Message) {
     // discarded, not the row that actually got persisted, so don't publish
     // them alongside content that doesn't match.
     const wonInsert = reply.content === content;
+    await maybeGenerateTitle(message.conversation_id, message.content ?? "", reply.content, log);
     await markMessageDone(pool, message.id);
     await publisher.publish(
       channel,

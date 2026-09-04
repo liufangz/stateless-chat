@@ -6,6 +6,9 @@ export interface Conversation {
   id: string;
   client_id: string;
   created_at: string;
+  // LLM-generated short title (auto-titling feature) - null until the first
+  // turn that successfully generates one. See setConversationTitle in db.ts.
+  title: string | null;
 }
 
 export interface ConversationSummary {
@@ -15,6 +18,17 @@ export interface ConversationSummary {
   updated_at: string;
   last_message: string | null;
   last_message_role: Role | null;
+  title: string | null;
+  // Outstanding-turn discovery (multi-conversation resume): the most recent
+  // 'user' row in this conversation whose OWN status is still
+  // pending/processing/failed, if any - null when every turn has a final
+  // reply. Lets the frontend find and reconnect every conversation with a
+  // turn in flight from one conversation-list fetch, without loading each
+  // conversation's full history first. See listConversations in db.ts for
+  // why this can't just be "is the last message overall a user row".
+  outstanding_message_id: string | null;
+  outstanding_status: MessageStatus | null;
+  outstanding_last_error: string | null;
 }
 
 // One entry of an assistant message's `tool_calls` JSONB column - mirrors the

@@ -54,6 +54,28 @@ npm run dev:worker
 
 Stop infra with `npm run infra:down` (data persists in a docker volume; add `-v` to wipe it).
 
+## Agent host access
+
+When the worker's tool flags are enabled, this is a **trusted full-host deployment**, not a
+sandbox:
+
+- `read_file`, `write_file`, and `edit_file` can read or mutate any path under `/home/ubuntu`,
+  including hidden files, `.env`, `.git`, `node_modules`, and files in any project. Relative paths
+  resolve from `/home/ubuntu`; absolute paths under `/home/ubuntu` are accepted. `/repo/...` remains
+  a legacy alias for the same root.
+- `bash` runs arbitrary commands as the `ubuntu` account with `HOME=/home/ubuntu` and cwd
+  `/home/ubuntu`. On the reference host, `ubuntu` has passwordless `sudo` and Docker access, so
+  bash can also read or modify paths outside `/home/ubuntu` and can change the machine itself.
+- File tools still reject `..` traversal and symlinks that resolve outside `/home/ubuntu`. These are
+  path-integrity checks, not a security sandbox. Bash can bypass them.
+- `write_file` and `edit_file` use the shared PostgreSQL file lock, but direct bash mutations do not
+  participate in that lock. Avoid overlapping shell/file-tool edits to the same path.
+
+Treat this capability as equivalent to giving the model a trusted operator shell. Do not expose the
+service to untrusted users. The agent should only delete data, expose credentials, or change auth,
+SSH, sudo, firewall, service, or deployment configuration when the user explicitly requests that
+specific action.
+
 ## Run the worker tests
 
 Some worker tests exercise real Postgres and `TRUNCATE` shared tables in `beforeAll`. Use the

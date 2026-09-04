@@ -10,7 +10,7 @@ let roots: PathJailRoots;
 
 beforeEach(async () => {
   repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "read-tool-repo-"));
-  roots = { repoRoot };
+  roots = { root: repoRoot };
 });
 
 afterEach(async () => {
@@ -65,24 +65,24 @@ describe("read_file tool", () => {
     await fs.rm(outside, { recursive: true, force: true });
   });
 
-  it("rejects .env paths even nominally under /repo", async () => {
+  it("reads .env paths under the allowed root", async () => {
     await fs.writeFile(path.join(repoRoot, ".env"), "SECRET=1");
     const tool = createReadFileTool({ roots });
-    await expect(tool.execute({ path: "/repo/.env" })).rejects.toThrow(/not allowed/);
+    await expect(tool.execute({ path: "/repo/.env" })).resolves.toContain("SECRET=1");
   });
 
-  it("rejects .git/ paths under /repo", async () => {
+  it("reads .git/ paths under the allowed root", async () => {
     await fs.mkdir(path.join(repoRoot, ".git"), { recursive: true });
     await fs.writeFile(path.join(repoRoot, ".git", "config"), "x");
     const tool = createReadFileTool({ roots });
-    await expect(tool.execute({ path: "/repo/.git/config" })).rejects.toThrow(/not allowed/);
+    await expect(tool.execute({ path: "/repo/.git/config" })).resolves.toContain("x");
   });
 
-  it("rejects node_modules paths under /repo", async () => {
+  it("reads node_modules paths under the allowed root", async () => {
     await fs.mkdir(path.join(repoRoot, "node_modules", "pkg"), { recursive: true });
     await fs.writeFile(path.join(repoRoot, "node_modules", "pkg", "index.js"), "x");
     const tool = createReadFileTool({ roots });
-    await expect(tool.execute({ path: "/repo/node_modules/pkg/index.js" })).rejects.toThrow(/not allowed/);
+    await expect(tool.execute({ path: "/repo/node_modules/pkg/index.js" })).resolves.toContain("x");
   });
 
   it("rejects '..' traversal", async () => {

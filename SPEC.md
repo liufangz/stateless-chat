@@ -34,6 +34,23 @@ Users send messages from a client (curl, browser, anything), and the bot streams
 - A minimal `docker-compose.yml` for postgres + redis, plus a root `package.json` with scripts: `dev` (run all), `dev:gateway`, `dev:worker`, `infra:up` / `infra:down`, and a README with run instructions.
 - No authentication complexity needed (a simple client-id header or query param is fine).
 
+## Agent host-access contract
+
+This deployment intentionally gives the trusted agent full host access:
+
+- The file tools (`read_file`, `write_file`, `edit_file`) cover the entire `/home/ubuntu` tree,
+  not only this repository. They can read and create/overwrite/edit dotfiles, credentials, Git
+  metadata, dependencies, and files belonging to other projects.
+- `bash` executes arbitrary commands as the `ubuntu` host account with `/home/ubuntu` as both HOME
+  and its default working directory. On the reference machine this account has passwordless sudo
+  and Docker access, so bash is effectively unrestricted machine access and can escape the home
+  directory.
+- The file APIs retain only path-integrity checks: literal `..` segments and symlinks resolving
+  outside `/home/ubuntu` are rejected. These checks do not sandbox bash.
+- This is a trusted single-user/operator mode. Destructive, credential, authentication, SSH,
+  sudo, firewall, service, and deployment changes still require an explicit user request from the
+  agent's perspective, but the runtime does not provide an OS-level safety barrier.
+
 ## Acceptance criteria
 
 - `npm run infra:up` starts postgres + redis; migrations/schema init run automatically on gateway start.
