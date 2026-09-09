@@ -31,18 +31,37 @@
  *      turn.
  *   3. during final-answer persistence - handled by the "already-final"
  *      branch below, not by dangling-row logic at all.
+ *
+ * A fourth crash window exists for a direct-tool turn (docs/FEATURE-slash-tools.md):
+ * it deliberately never writes the plain final-reply row "already-final"
+ * above looks for (see "one result, no LLM follow-up" - insertAssistantMessage
+ * is skipped on purpose), so once its one-and-only request row is fully
+ * resolved, that IS the turn being done, not merely "ready" for another LLM
+ * round. See `already-final-direct` below and its use in the `pending.length
+ * === 0` branches.
  */
 import type pg from "pg";
 import { getMessagesByReplyTo, insertToolResult } from "@stateless-chat/shared";
 import type { Message } from "@stateless-chat/shared";
 import { executeToolCall, isToolCallAssistantRow } from "./tool-loop.js";
 import type { Tool } from "./tool-loop.js";
+import { parseDirectInvocation } from "./direct-tool.js";
 
 export type ReconcileOutcome =
   /** Nothing pending (fresh turn, or previous attempt's last dangling row was fully read-only and has now been resolved). Start the loop at startIteration. */
   | { kind: "ready"; startIteration: number }
   /** A previous attempt already produced and persisted the turn's final answer - don't call the LLM again, just complete the turn from `reply`. */
   | { kind: "already-final"; reply: Message }
+  /**
+   * A direct-tool turn (docs/FEATURE-slash-tools.md) whose one tool-call
+   * request row is fully resolved (every call has a result row) - the turn
+   * is done, it just never reached markMessageDone/publish before a crash.
+   * Unlike `already-final` there is no assistant text row to read a reply
+   * from: the caller completes the turn the same way a first attempt's
+   * runDirectToolTurn does (markMessageDone + publish `done` with empty
+   * content, no LLM call).
+   */
+  | { kind: "already-final-direct" }
   /**
    * A previous attempt crashed with an unresolved tool call whose execution
    * status is unknown and unsafe to guess (a mutating tool). The turn
@@ -56,7 +75,15 @@ export async function reconcileTurnState(
   pool: pg.Pool,
   tools: Tool[],
   conversationId: string,
-  userMessageId: string
+  userMessageId: string,
+  /**
+   * The turn's triggering user message content, if the caller has it handy
+   * - needed ONLY to detect the `already-final-direct` case above. Omitted
+   * entirely by tests/callers that don't care (falls back to the plain
+   * `ready` outcome the direct-turn-unaware version of this function always
+   * returned, so this is purely additive).
+   */
+  userMessageContent?: string
 ): Promise<ReconcileOutcome> {
   const rows = await getMessagesByReplyTo(pool, userMessageId);
 
@@ -64,6 +91,14 @@ export async function reconcileTurnState(
   if (finalReply) {
     return { kind: "already-final", reply: finalReply };
   }
+
+  const toolsByName = new Map(tools.map((t) => [t.name, t]));
+
+  const isDoneDirectTurn = (): boolean => {
+    if (userMessageContent === undefined) return false;
+    const parsed = parseDirectInvocation(userMessageContent);
+    return parsed !== null && toolsByName.has(parsed.toolName);
+  };
 
   const requestRows = rows
     .filter(isToolCallAssistantRow)
@@ -81,10 +116,10 @@ export async function reconcileTurnState(
   const pending = (lastRequest.tool_calls ?? []).filter((tc) => !resultIds.has(tc.id));
 
   if (pending.length === 0) {
+    if (isDoneDirectTurn()) return { kind: "already-final-direct" };
     return { kind: "ready", startIteration: maxIteration + 1 };
   }
 
-  const toolsByName = new Map(tools.map((t) => [t.name, t]));
   const unsafe = pending.filter((tc) => toolsByName.get(tc.name)?.readOnly !== true);
 
   if (unsafe.length > 0) {
@@ -117,5 +152,6 @@ export async function reconcileTurnState(
     });
   }
 
+  if (isDoneDirectTurn()) return { kind: "already-final-direct" };
   return { kind: "ready", startIteration: maxIteration + 1 };
 }

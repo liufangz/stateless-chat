@@ -29,10 +29,17 @@ import type { CompactionEntry, ToolEvent } from "./tool-loop.js";
 import { Lifecycle, createLoggingHooks } from "./lifecycle.js";
 import type { LifecycleMessage } from "./lifecycle.js";
 import { reconcileTurnState } from "./turn-recovery.js";
+import { parseDirectInvocation, runDirectToolTurn } from "./direct-tool.js";
 
 const pool = createPool();
 const publisher = createRedisClient();
 const subscriber = createRedisSubscriber();
+
+// Built once from the static tool registry - reused by both the direct-tool
+// dispatch check below and runDirectToolTurn itself, so "is this a bound
+// tool" is answered the same way every time (DEFAULT_TOOLS, the same set
+// reconcileTurnState is given for recovery decisions).
+const toolsByName = new Map(DEFAULT_TOOLS.map((t) => [t.name, t]));
 
 const POLL_INTERVAL_MS = 1000;
 let claiming = false;
@@ -120,7 +127,41 @@ async function processMessage(message: Message) {
     // we never re-run a step that already has a committed result, and
     // never silently guess the outcome of a mutating tool call left
     // dangling by a crash.
-    const reconciled = await reconcileTurnState(pool, DEFAULT_TOOLS, message.conversation_id, message.id);
+    const reconciled = await reconcileTurnState(
+      pool,
+      DEFAULT_TOOLS,
+      message.conversation_id,
+      message.id,
+      message.content ?? ""
+    );
+
+    if (reconciled.kind === "already-final-direct") {
+      // A previous attempt's direct-tool turn (docs/FEATURE-slash-tools.md)
+      // already executed the tool and durably persisted its result - only
+      // markMessageDone/publish were missed before the crash. Unlike
+      // "already-final" below there is no assistant text row to read a
+      // reply from (a direct-tool turn never writes one - "one result, no
+      // LLM follow-up"), so complete it the exact same way a first attempt's
+      // runDirectToolTurn does: empty-content `done`, no LLM call.
+      if (!(await stillOwnsLease(pool, message.id, env.workerId))) {
+        log("lease no longer owned while completing an already-final direct-tool turn - not overwriting");
+        return;
+      }
+      await markMessageDone(pool, message.id);
+      await publisher.publish(
+        channel,
+        JSON.stringify({
+          type: "done",
+          messageId: message.id,
+          content: "",
+          usage: null,
+          speedTps: null,
+          durationMs: null,
+        })
+      );
+      log("done (recovered: direct-tool turn's result was already durably persisted by a previous attempt)");
+      return;
+    }
 
     if (reconciled.kind === "already-final") {
       // A previous attempt already produced and durably persisted this
@@ -197,6 +238,23 @@ async function processMessage(message: Message) {
       }
       log("blocked: unresolved mutating tool call from a previous crash needs manual resolution");
       return;
+    }
+
+    // Direct-tool dispatch (docs/FEATURE-slash-tools.md): only ever a fresh
+    // turn's FIRST attempt - reconcileTurnState already handles every other
+    // state a direct-tool turn can be found in (already-final-direct,
+    // blocked-mutation for a mutating call crashed mid-flight). Restricting
+    // this to startIteration === 0 is what stops a RECLAIMED direct-tool
+    // turn from re-executing the tool from scratch instead of going through
+    // reconcile's dangling-row logic above.
+    if (reconciled.startIteration === 0) {
+      const invocation = parseDirectInvocation(message.content ?? "");
+      const directTool = invocation ? toolsByName.get(invocation.toolName) : undefined;
+      if (invocation && directTool) {
+        await runDirectToolTurn(pool, message, channel, publisher, toolsByName, invocation, log);
+        log("done (direct tool call, no LLM follow-up)");
+        return;
+      }
     }
 
     const history = await getConversationHistory(pool, message.conversation_id);

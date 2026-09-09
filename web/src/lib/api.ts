@@ -1,4 +1,4 @@
-import type { CompactionSummary, ConversationSummary, Message, ToolCallDetail } from '../types';
+import type { CompactionSummary, ConversationSummary, Message, ToolCallDetail, ToolManifest } from '../types';
 
 const API_BASE = '/api';
 
@@ -91,6 +91,20 @@ export function getHistory(
   conversationId: string,
 ): Promise<{ conversationId: string; messages: Message[]; compactions: CompactionSummary[] }> {
   return jsonFetch(`/conversations/${conversationId}/messages`);
+}
+
+// Slash-invoked tools (docs/FEATURE-slash-tools.md §4.4): the tool set is
+// static per deployment (env-flag gated, worker restart to change) - one
+// in-memory cache entry per conversation is enough; no localStorage, no
+// refetch per keystroke while the composer's slash picker is open.
+const boundToolsCache = new Map<string, ToolManifest[]>();
+
+export async function getBoundTools(conversationId: string): Promise<ToolManifest[]> {
+  const cached = boundToolsCache.get(conversationId);
+  if (cached) return cached;
+  const { tools } = await jsonFetch<{ tools: ToolManifest[] }>(`/conversations/${conversationId}/tools`);
+  boundToolsCache.set(conversationId, tools);
+  return tools;
 }
 
 export function fetchToolCalls(

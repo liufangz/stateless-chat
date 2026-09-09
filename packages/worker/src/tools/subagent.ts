@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { TOOL_MANIFESTS, manifestToJsonSchema } from "@stateless-chat/shared";
 import type { Message } from "@stateless-chat/shared";
 import { Lifecycle, createLoggingHooks } from "../lifecycle.js";
 import type { AgentEvent, LifecycleListener } from "../lifecycle.js";
@@ -39,6 +40,7 @@ import type { ChatCompletionsClient, RunLoopResult, Tool } from "../tool-loop.js
 // ---------------------------------------------------------------------------
 
 export const SUBAGENT_TOOL_NAME = "subagent";
+const SUBAGENT_MANIFEST = TOOL_MANIFESTS.find((m) => m.name === SUBAGENT_TOOL_NAME)!;
 /** Hard nesting cap: a subagent may not spawn a deeper subagent past this. */
 export const MAX_SUBAGENT_DEPTH = 3;
 /** Child wall-clock budget when the parent doesn't bind one (static tool). */
@@ -88,41 +90,10 @@ export function createSubagentTool(options: SubagentToolOptions = {}): Tool {
   } = options;
 
   return {
-    name: SUBAGENT_TOOL_NAME,
+    name: SUBAGENT_MANIFEST.name,
     parallelSafe: true,
-    description:
-      "Delegate a self-contained task to a subagent that runs its own tool loop " +
-      "and returns a complete written answer. The `task` argument MUST include ALL " +
-      "context the subagent needs - it has no access to this conversation's history " +
-      "or your other tool results. Only the final answer text comes back to you, so " +
-      "instruct the subagent to return everything you need in its answer. The optional " +
-      "`tools` argument restricts which tools the subagent may use; omit it for the " +
-      "full tool set (the subagent tool itself is never available to a subagent, so " +
-      "nesting cannot recurse infinitely).",
-    parameters: {
-      type: "object",
-      properties: {
-        task: {
-          type: "string",
-          description:
-            "Self-contained instruction for the subagent, including all context it needs. " +
-            "Ask for a complete, self-contained final answer.",
-        },
-        context: {
-          type: "string",
-          description:
-            "Optional extra context appended to the task (e.g. file excerpts, findings).",
-        },
-        tools: {
-          type: "array",
-          items: { type: "string" },
-          description:
-            "Optional allowlist of tool names the subagent may use, e.g. [\"read_file\", \"bash\"]. " +
-            "Omit to allow all non-subagent tools.",
-        },
-      },
-      required: ["task"],
-    },
+    description: SUBAGENT_MANIFEST.description,
+    parameters: manifestToJsonSchema(SUBAGENT_MANIFEST),
     async execute(args: unknown): Promise<string> {
       const { task, context, tools: requestedTools } = (args ?? {}) as {
         task?: unknown;

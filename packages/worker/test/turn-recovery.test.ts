@@ -33,9 +33,9 @@ requireDisposableTestDatabase(env.databaseUrl);
 
 const pool = createPool();
 
-async function freshTurn(): Promise<{ conversationId: string; userMessageId: string }> {
+async function freshTurn(content = "hi"): Promise<{ conversationId: string; userMessageId: string }> {
   const conv = await createConversation(pool, "test-client");
-  const msg = await insertUserMessage(pool, conv.id, "hi");
+  const msg = await insertUserMessage(pool, conv.id, content);
   return { conversationId: conv.id, userMessageId: msg.id };
 }
 
@@ -175,6 +175,125 @@ describe("reconcileTurnState", () => {
 
     const rows = await getMessagesByReplyTo(pool, userMessageId);
     expect(rows.some((r) => r.role === "tool")).toBe(false);
+  });
+
+  it("a fully-resolved direct-tool turn's request row is 'already-final-direct', not 'ready'", async () => {
+    const { conversationId, userMessageId } = await freshTurn("/calculator 1+1");
+    const calculatorTool = makeTool("calculator", true, () => "2");
+    await insertToolCallRequest(pool, conversationId, userMessageId, 0, [
+      { toolCallId: "call_1", toolName: "calculator", arguments: '{"expression":"1+1"}' },
+    ]);
+    await insertToolResult(pool, conversationId, userMessageId, {
+      toolCallId: "call_1",
+      toolName: "calculator",
+      result: "2",
+      isError: false,
+    });
+
+    const result = await reconcileTurnState(
+      pool,
+      [calculatorTool],
+      conversationId,
+      userMessageId,
+      "/calculator 1+1"
+    );
+    expect(result).toEqual({ kind: "already-final-direct" });
+  });
+
+  it("a direct-tool turn whose pending READ-ONLY call gets auto-resolved is 'already-final-direct', not 'ready'", async () => {
+    const { conversationId, userMessageId } = await freshTurn("/calculator 1+1");
+    let executed = 0;
+    const calculatorTool = makeTool("calculator", true, () => {
+      executed++;
+      return "2";
+    });
+    await insertToolCallRequest(pool, conversationId, userMessageId, 0, [
+      { toolCallId: "call_1", toolName: "calculator", arguments: '{"expression":"1+1"}' },
+    ]);
+
+    const result = await reconcileTurnState(
+      pool,
+      [calculatorTool],
+      conversationId,
+      userMessageId,
+      "/calculator 1+1"
+    );
+    expect(result).toEqual({ kind: "already-final-direct" });
+    expect(executed).toBe(1);
+  });
+
+  it("a fully-resolved dangling row is plain 'ready' when userMessageContent is omitted (LLM-turn callers unaffected)", async () => {
+    const { conversationId, userMessageId } = await freshTurn("/calculator 1+1");
+    const calculatorTool = makeTool("calculator", true, () => "2");
+    await insertToolCallRequest(pool, conversationId, userMessageId, 0, [
+      { toolCallId: "call_1", toolName: "calculator", arguments: '{"expression":"1+1"}' },
+    ]);
+    await insertToolResult(pool, conversationId, userMessageId, {
+      toolCallId: "call_1",
+      toolName: "calculator",
+      result: "2",
+      isError: false,
+    });
+
+    const result = await reconcileTurnState(pool, [calculatorTool], conversationId, userMessageId);
+    expect(result).toEqual({ kind: "ready", startIteration: 1 });
+  });
+
+  it("a fully-resolved dangling row for ordinary (non-slash) content is plain 'ready', not 'already-final-direct'", async () => {
+    const { conversationId, userMessageId } = await freshTurn("what's 1+1?");
+    const calculatorTool = makeTool("calculator", true, () => "2");
+    await insertToolCallRequest(pool, conversationId, userMessageId, 0, [
+      { toolCallId: "call_1", toolName: "calculator", arguments: '{"expression":"1+1"}' },
+    ]);
+    await insertToolResult(pool, conversationId, userMessageId, {
+      toolCallId: "call_1",
+      toolName: "calculator",
+      result: "2",
+      isError: false,
+    });
+
+    const result = await reconcileTurnState(
+      pool,
+      [calculatorTool],
+      conversationId,
+      userMessageId,
+      "what's 1+1?"
+    );
+    expect(result).toEqual({ kind: "ready", startIteration: 1 });
+  });
+
+  it("a fully-resolved dangling row whose content names a tool NOT in the passed-in tools list is plain 'ready' (fallback safety)", async () => {
+    const { conversationId, userMessageId } = await freshTurn("/calculator 1+1");
+    await insertToolCallRequest(pool, conversationId, userMessageId, 0, [
+      { toolCallId: "call_1", toolName: "calculator", arguments: '{"expression":"1+1"}' },
+    ]);
+    await insertToolResult(pool, conversationId, userMessageId, {
+      toolCallId: "call_1",
+      toolName: "calculator",
+      result: "2",
+      isError: false,
+    });
+
+    // Empty tools list: "calculator" isn't bound/known here, so despite the
+    // slash-shaped content this must NOT be treated as a direct-tool turn.
+    const result = await reconcileTurnState(pool, [], conversationId, userMessageId, "/calculator 1+1");
+    expect(result).toEqual({ kind: "ready", startIteration: 1 });
+  });
+
+  it("a direct-tool turn with a pending MUTATING call is still blocked, exactly like an LLM-issued one", async () => {
+    const { conversationId, userMessageId } = await freshTurn("/bash rm -rf /tmp/x");
+    let executed = 0;
+    const bashTool = makeTool("bash", false, () => {
+      executed++;
+      return "ran";
+    });
+    await insertToolCallRequest(pool, conversationId, userMessageId, 0, [
+      { toolCallId: "call_1", toolName: "bash", arguments: '{"command":"rm -rf /tmp/x"}' },
+    ]);
+
+    const result = await reconcileTurnState(pool, [bashTool], conversationId, userMessageId, "/bash rm -rf /tmp/x");
+    expect(result.kind).toBe("blocked-mutation");
+    expect(executed).toBe(0);
   });
 
   it("reconciling the same read-only-pending turn twice does not create a duplicate result row", async () => {

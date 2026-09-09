@@ -2,11 +2,14 @@ import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type pg from "pg";
+import { TOOL_MANIFESTS, manifestToJsonSchema } from "@stateless-chat/shared";
 import type { Tool } from "../tool-loop.js";
 import { HOME_ROOT } from "./bash.js";
 import { canonicalLockKey, resolveWritePath, type PathJailRoots } from "./file-path-jail.js";
 import { writeFileAtomic } from "./atomic-write.js";
 import { createPostgresFileLock, withFileLock, type FileLock } from "./file-lock.js";
+
+const WRITE_FILE_MANIFEST = TOOL_MANIFESTS.find((m) => m.name === "write_file")!;
 
 const MAX_WRITE_BYTES = 256 * 1024;
 
@@ -29,38 +32,9 @@ export function createWriteFileTool(options?: WriteFileToolOptions): Tool {
   const lock = options?.lock ?? createPostgresFileLock(options?.pool);
 
   return {
-    name: "write_file",
-    description:
-      "Write content to any file under /home/ubuntu, creating parent directories as needed. " +
-      "Overwrites the file if it already exists, including dotfiles, .env, .git, node_modules, " +
-      "and files belonging to any project. " +
-      "Coordinates with other in-flight write_file/edit_file calls (including from other worker " +
-      "processes) via a shared lock, so two concurrent writers to the same path never interleave. " +
-      "To safely overwrite a file you have already read, pass 'expected_hash' (the sha256 hex digest " +
-      "of the content you read) - if the file has changed since then, the write is rejected instead " +
-      "of silently discarding whoever changed it. Omit 'expected_hash' when creating a new file, or " +
-      "when you intentionally want to overwrite unconditionally.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description:
-            "File path under /home/ubuntu. Relative paths resolve there; absolute paths under /home/ubuntu " +
-            "are accepted. /repo/... is a legacy alias for /home/ubuntu/.... No filename class is " +
-            "blocked inside the allowed root.",
-        },
-        content: { type: "string", description: "Full file content (overwrites if the file exists)" },
-        expected_hash: {
-          type: "string",
-          description:
-            "Optional sha256 hex digest of the file's current content, as it was when you last read it. " +
-            "Only checked when the file already exists. If the file's actual current content doesn't " +
-            "match, the write fails clearly instead of discarding a change made since your last read.",
-        },
-      },
-      required: ["path", "content"],
-    },
+    name: WRITE_FILE_MANIFEST.name,
+    description: WRITE_FILE_MANIFEST.description,
+    parameters: manifestToJsonSchema(WRITE_FILE_MANIFEST),
     async execute(args: unknown): Promise<string> {
       const {
         path: rawPath,

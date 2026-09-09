@@ -73,6 +73,25 @@ export interface CompactionSummary {
   completionTokens: number | null;
 }
 
+// Slash-invoked tools (docs/FEATURE-slash-tools.md): mirrors
+// packages/shared/src/tools.ts's ToolArgManifest/ToolManifest, served by
+// GET /conversations/:id/tools.
+export interface ToolArgManifest {
+  name: string;
+  type: 'string' | 'number' | 'boolean' | 'object' | 'array';
+  required: boolean;
+  description: string;
+  placeholder: string;
+}
+
+export interface ToolManifest {
+  name: string;
+  description: string;
+  /** True for a tool with no side effect - gates the composer's no-popup freehand fast path (see FEATURE-slash-tools.md §4.4/§6). */
+  readOnly: boolean;
+  args: ToolArgManifest[];
+}
+
 export interface ConversationSummary {
   id: string;
   client_id: string;

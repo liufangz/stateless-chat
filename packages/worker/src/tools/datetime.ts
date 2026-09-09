@@ -1,21 +1,13 @@
+import { TOOL_MANIFESTS, manifestToJsonSchema } from "@stateless-chat/shared";
 import type { Tool } from "../tool-loop.js";
 
+const MANIFEST = TOOL_MANIFESTS.find((m) => m.name === "get_current_datetime")!;
+
 export const getCurrentDatetimeTool: Tool = {
-  name: "get_current_datetime",
-  description:
-    "Get the current date and time, optionally formatted for a specific IANA timezone.",
-  readOnly: true,
-  parameters: {
-    type: "object",
-    properties: {
-      timezone: {
-        type: "string",
-        description:
-          "IANA timezone name, e.g. 'America/New_York'. Defaults to UTC when omitted.",
-      },
-    },
-    required: [],
-  },
+  name: MANIFEST.name,
+  description: MANIFEST.description,
+  readOnly: MANIFEST.readOnly,
+  parameters: manifestToJsonSchema(MANIFEST),
   execute(args: unknown): string {
     const { timezone } = (args ?? {}) as { timezone?: unknown };
     const now = new Date();

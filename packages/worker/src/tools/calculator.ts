@@ -1,20 +1,13 @@
+import { TOOL_MANIFESTS, manifestToJsonSchema } from "@stateless-chat/shared";
 import type { Tool } from "../tool-loop.js";
 
+const MANIFEST = TOOL_MANIFESTS.find((m) => m.name === "calculator")!;
+
 export const calculatorTool: Tool = {
-  name: "calculator",
-  description:
-    "Evaluate a basic arithmetic expression. Supports + - * / ^ (power), sqrt(), and parentheses.",
-  readOnly: true,
-  parameters: {
-    type: "object",
-    properties: {
-      expression: {
-        type: "string",
-        description: "Arithmetic expression, e.g. '(2 + 3) * 4' or 'sqrt(16)'",
-      },
-    },
-    required: ["expression"],
-  },
+  name: MANIFEST.name,
+  description: MANIFEST.description,
+  readOnly: MANIFEST.readOnly,
+  parameters: manifestToJsonSchema(MANIFEST),
   execute(args: unknown): string {
     const { expression } = (args ?? {}) as { expression?: unknown };
     if (typeof expression !== "string" || expression.trim() === "") {

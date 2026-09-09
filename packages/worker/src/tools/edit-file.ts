@@ -1,10 +1,13 @@
 import { promises as fs } from "node:fs";
 import type pg from "pg";
+import { TOOL_MANIFESTS, manifestToJsonSchema } from "@stateless-chat/shared";
 import type { Tool } from "../tool-loop.js";
 import { HOME_ROOT } from "./bash.js";
 import { canonicalLockKey, resolveWritePath, type PathJailRoots } from "./file-path-jail.js";
 import { writeFileAtomic } from "./atomic-write.js";
 import { createPostgresFileLock, withFileLock, type FileLock } from "./file-lock.js";
+
+const EDIT_FILE_MANIFEST = TOOL_MANIFESTS.find((m) => m.name === "edit_file")!;
 
 function countOccurrences(content: string, needle: string): number {
   if (needle === "") return 0;
@@ -32,26 +35,9 @@ export function createEditFileTool(options?: EditFileToolOptions): Tool {
   const lock = options?.lock ?? createPostgresFileLock(options?.pool);
 
   return {
-    name: "edit_file",
-    description:
-      "Edit any file under /home/ubuntu by replacing exact text. 'old_string' must match the file's " +
-      "content exactly once. Dotfiles, .env, .git, node_modules, and files in any project are included. " +
-      "Coordinates with other in-flight write_file/edit_file calls (including " +
-      "from other worker processes) via a shared lock: the file is re-read fresh once the lock is " +
-      "held, so if its content changed since you last saw it, 'old_string' simply won't match anymore " +
-      "and this fails clearly instead of applying against stale content.",
-    parameters: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "File path under /home/ubuntu (same rules as write_file)" },
-        old_string: {
-          type: "string",
-          description: "Exact text to replace. Must match exactly once in the file.",
-        },
-        new_string: { type: "string", description: "Replacement text" },
-      },
-      required: ["path", "old_string", "new_string"],
-    },
+    name: EDIT_FILE_MANIFEST.name,
+    description: EDIT_FILE_MANIFEST.description,
+    parameters: manifestToJsonSchema(EDIT_FILE_MANIFEST),
     async execute(args: unknown): Promise<string> {
       const {
         path: rawPath,

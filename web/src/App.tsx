@@ -4,6 +4,8 @@ import {
   checkAuthStatus,
   createConversation,
   deleteConversation,
+  fetchToolCalls,
+  getBoundTools,
   getHistory,
   listConversations,
   logout,
@@ -20,7 +22,7 @@ import {
   type ConversationAction,
   type ConversationsState,
 } from './lib/conversationStore';
-import type { ConversationSummary, Message } from './types';
+import type { ConversationSummary, Message, ToolManifest } from './types';
 import { MessageList } from './components/MessageList';
 import { StatsBar } from './components/StatsBar';
 import { Composer } from './components/Composer';
@@ -55,6 +57,11 @@ export default function App() {
   // whether it's currently selected, which is what lets a background
   // conversation keep streaming while a different one is in view.
   const [conversationId, setConversationId] = useState<string | null>(null);
+  // Slash-invoked tools (docs/FEATURE-slash-tools.md): the bound-tool set for
+  // whichever conversation is currently selected. null while not yet loaded
+  // (or for a conversation whose fetch failed) - Composer treats that the
+  // same as "no tools", never blocking a normal send.
+  const [tools, setTools] = useState<ToolManifest[] | null>(null);
   const [initState, setInitState] = useState<InitState>('loading');
   // Only for failures with no conversation to attach them to yet (initial
   // load, creating a brand-new chat) - everything else is a per-conversation
@@ -102,6 +109,28 @@ export default function App() {
   useEffect(() => {
     if (!isMobile && sidebarOpen) setSidebarOpen(false);
   }, [isMobile, sidebarOpen]);
+
+  // Slash-invoked tools: refetch (cached per-conversation in api.ts, so this
+  // is a cache hit after the first load) whenever the selected conversation
+  // changes. Best-effort - a failed fetch just leaves `tools` null, which
+  // Composer treats as "no picker available", never blocking a normal send.
+  useEffect(() => {
+    if (!conversationId) {
+      setTools(null);
+      return;
+    }
+    let cancelled = false;
+    getBoundTools(conversationId)
+      .then((fetched) => {
+        if (!cancelled) setTools(fetched);
+      })
+      .catch(() => {
+        if (!cancelled) setTools(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId]);
 
   // Subscribes to a turn's SSE stream and wires it to this conversation's
   // entry in convState - regardless of whether that conversation is
@@ -164,6 +193,32 @@ export default function App() {
             dispatchSync({ type: 'compactions/refreshed', id: targetConversationId, compactions: history.compactions });
           } catch {
             // Best-effort refresh - the streamed content already rendered above.
+          }
+          try {
+            // Materializes a missed tool chip from the DB
+            // (docs/FEATURE-slash-tools.md §4.4): a direct-tool turn is fast
+            // enough that tool_start/tool_end can race ahead of the
+            // EventSource attach, which would otherwise leave a stale
+            // "running" chip with no tool_end to ever clear it. Scoped to
+            // this ONE message (turn/toolsReconciled merges into it, unlike
+            // history/loaded's full-array replace) so it can't race a second
+            // turn's optimistic messages if the user has already moved on by
+            // the time this resolves.
+            const toolCalls = await fetchToolCalls(targetConversationId, replyToMessageId);
+            dispatchSync({
+              type: 'turn/toolsReconciled',
+              id: targetConversationId,
+              assistantId,
+              toolCalls: toolCalls.map((tc) => ({
+                id: tc.id,
+                name: tc.name,
+                arguments: tc.arguments,
+                isError: tc.isError,
+              })),
+            });
+          } catch {
+            // Best-effort - a live tool_start/tool_end pair already rendered
+            // above in the common (non-racing) case.
           }
           refreshConversations();
         },
@@ -585,7 +640,7 @@ export default function App() {
               <div className="px-4 py-1 text-center text-xs text-red-500">{activeEntry.error}</div>
             )}
             <StatsBar messages={activeEntry.messages} sending={sending} />
-            <Composer onSend={handleSend} disabled={sending} />
+            <Composer onSend={handleSend} disabled={sending} tools={tools} />
           </>
         )}
       </div>

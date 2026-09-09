@@ -308,6 +308,54 @@ describe('conversationsReducer: tool call lifecycle and per-conversation errors'
     expect(assistant.tool_calls?.[0]).toMatchObject({ id: 'call-1', running: false, isError: false });
   });
 
+  it('turn/toolsReconciled replaces one message\'s tool_calls without touching the rest of the message list', () => {
+    let state: ConversationsState = {};
+    state = conversationsReducer(state, {
+      type: 'turn/started',
+      id: 'conv-a',
+      userMessage: userMsg('u-a'),
+      assistantId: 'pending-u-a',
+      closeStream: vi.fn(),
+    });
+    state = conversationsReducer(state, {
+      type: 'turn/toolStart',
+      id: 'conv-a',
+      assistantId: 'pending-u-a',
+      toolCallId: 'call-1',
+      toolName: 'calculator',
+      args: { expression: '1+1' },
+    });
+    // Simulate the race this action exists to fix: tool_end never arrived
+    // (raced ahead of the EventSource attach), so the chip is stuck
+    // "running" until the reconcile fetch resolves.
+    state = conversationsReducer(state, {
+      type: 'turn/toolsReconciled',
+      id: 'conv-a',
+      assistantId: 'pending-u-a',
+      toolCalls: [{ id: 'call-1', name: 'calculator', arguments: '{"expression":"1+1"}', isError: false }],
+    });
+
+    const assistant = state['conv-a'].messages.find((m) => m.id === 'pending-u-a')!;
+    expect(assistant.tool_calls).toEqual([
+      { id: 'call-1', name: 'calculator', arguments: '{"expression":"1+1"}', isError: false },
+    ]);
+    // The user row and every other field on the entry are untouched - this
+    // is a targeted merge, not a full-array replace.
+    expect(state['conv-a'].messages.find((m) => m.id === 'u-a')).toBeDefined();
+    expect(state['conv-a'].messages).toHaveLength(2);
+  });
+
+  it('turn/toolsReconciled for a message no longer present is a harmless no-op (e.g. history reloaded in between)', () => {
+    let state: ConversationsState = { 'conv-a': { ...EMPTY_CONVERSATION_ENTRY, messages: [userMsg('u-a')] } };
+    state = conversationsReducer(state, {
+      type: 'turn/toolsReconciled',
+      id: 'conv-a',
+      assistantId: 'pending-gone',
+      toolCalls: [{ id: 'call-1', name: 'calculator', isError: false }],
+    });
+    expect(state['conv-a'].messages).toEqual([userMsg('u-a')]);
+  });
+
   it('an error set on one conversation never appears on another', () => {
     let state: ConversationsState = {};
     state = conversationsReducer(state, { type: 'error/set', id: 'conv-a', error: 'boom in A' });

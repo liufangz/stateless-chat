@@ -25,6 +25,7 @@ import {
   AUTH_COOKIE_NAME,
   AUTH_COOKIE_MAX_AGE_MS,
   estimateHistoricalContextTokens,
+  enabledToolManifests,
 } from "@stateless-chat/shared";
 import type { StreamEvent } from "@stateless-chat/shared";
 import { parseCookies, serializeCookie } from "./cookies.js";
@@ -314,6 +315,26 @@ async function main() {
     })
   );
 
+  // Slash-invoked tools (docs/FEATURE-slash-tools.md): the tool manifests
+  // bound to this conversation. Filtered by the SAME env flags the worker
+  // uses to build DEFAULT_TOOLS (packages/worker/src/tools/index.ts), so
+  // "bound to this chat" == "this deployment's enabled tools" - what this
+  // worker can actually execute. A future per-conversation subset (a
+  // conversation_tools join table + a bind/unbind admin surface) plugs in
+  // here without changing this response's shape. Static per request - no DB
+  // query, no server-side cache needed.
+  app.get(
+    "/conversations/:conversationId/tools",
+    asyncHandler(async (req: Request, res: Response) => {
+      const conversation = await getConversation(pool, req.params.conversationId);
+      if (!conversation) {
+        res.status(404).json({ error: "conversation not found" });
+        return;
+      }
+      res.status(200).json({ tools: enabledToolManifests(env) });
+    })
+  );
+
   // Full tool exchange (arguments + results) for a single turn, keyed by the
   // USER message id - that's the join key both the worker and the grouped
   // history response use for `reply_to_message_id`. Chips in the history
@@ -568,8 +589,32 @@ async function main() {
         }
       }
 
-      if (userMessage.status === "failed") {
-        send("error", { message: userMessage.last_error ?? "message processing failed" });
+      // Re-fetch status fresh here rather than trusting the `userMessage`
+      // snapshot taken above (before the Redis subscribe) - several awaits
+      // have happened since then (subscribe, existingReply, priorRows), and
+      // a direct-tool turn (docs/FEATURE-slash-tools.md) can complete in
+      // well under that time. This is exactly the gap `existingReply` above
+      // was supposed to close: it only recognizes a plain final-text reply
+      // row, which a direct-tool turn never writes ("one result, no LLM
+      // follow-up"), so its own `done` - published on Redis before this
+      // client ever subscribed, and pub/sub delivers to no one after the
+      // fact - would otherwise be lost forever and this connection would
+      // hang past `existingReply`, past the tool replay above, and into the
+      // live-wait below with no publisher left to complete it.
+      const latestUserMessage = (await getMessage(pool, messageId)) ?? userMessage;
+
+      if (latestUserMessage.status === "done") {
+        // Reachable ONLY for a direct-tool turn: any other path to
+        // status='done' persists a plain final-text reply row BEFORE
+        // markMessageDone, which `existingReply` above already caught.
+        send("done", { content: "", usage: null, speedTps: null, durationMs: null });
+        res.end();
+        cleanup();
+        return;
+      }
+
+      if (latestUserMessage.status === "failed") {
+        send("error", { message: latestUserMessage.last_error ?? "message processing failed" });
         res.end();
         cleanup();
         return;

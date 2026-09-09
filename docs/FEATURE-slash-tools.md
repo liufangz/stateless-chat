@@ -1,13 +1,33 @@
 # FEATURE — Slash-invoked tools: pick a bound tool, fill args, run once (no follow-up)
 
-**Status: design / plan. Not implemented.**
+**Status: implemented** (all 8 checklist items in §8; 271 worker + 6 gateway +
+55 web tests passing, plus a manual curl-driven E2E pass against a live
+gateway+worker+Postgres+Redis stack covering calculator, an accepted
+malformed-args call, unknown-tool LLM fallthrough, and the live vs.
+already-finished SSE reconnect paths).
 
 **Revision note:** a review pass found the original crash-recovery paragraph
 in §4.3 too vague to implement safely (it could leave a recovered direct-tool
 turn re-invoking the LLM, which the whole feature exists to avoid), a
 manifest/type gap around the `subagent` tool's real argument list, and a race
 in the proposed web-side reconcile fix. §2, §4.1, §4.3, §4.4, and §6 below
-have been rewritten to close those; nothing else changed.
+were rewritten to close those before implementation started.
+
+**Implementation note (bug found beyond the plan):** the manual E2E pass
+surfaced a gap neither the original plan nor the review caught: the
+gateway's SSE stream endpoint's reconnect shortcut (`existingReply` via
+`getReply`, `packages/gateway/src/index.ts`) only recognizes a plain
+final-text assistant row. A direct-tool turn never writes one by design, so
+for a turn fast enough to finish before the client's `GET .../stream`
+request's Redis subscribe lands (calculator reliably does), the worker's
+`done` event - published with no subscriber yet listening - was lost
+forever and the connection hung indefinitely past the tool-replay section
+with nothing left to complete it. Fixed by re-checking the message's status
+fresh (not the pre-subscribe snapshot) right before the live-wait section:
+`status === "done"` with no plain reply found is reachable *only* for a
+completed direct-tool turn (every other path to `done` persists that row
+first), so it synthesizes the matching empty-content `done` event instead of
+falling through to a wait that would never resolve.
 
 **One plan document** for adding a slash-command tool picker to the Stateless Chat
 front end, where the chosen tool is executed *exactly like a normal LLM tool call*

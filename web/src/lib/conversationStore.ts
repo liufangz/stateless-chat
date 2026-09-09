@@ -1,4 +1,4 @@
-import type { CompactionSummary, Message, MessageStep, MessageUsage } from '../types';
+import type { CompactionSummary, Message, MessageStep, MessageUsage, ToolCallSummary } from '../types';
 
 /**
  * Per-conversation slice of chat state. Multiple entries can exist - and
@@ -59,6 +59,7 @@ export type ConversationAction =
   | { type: 'turn/token'; id: string; assistantId: string; chunk: string; liveSpeedTps?: number }
   | { type: 'turn/toolStart'; id: string; assistantId: string; toolCallId: string; toolName: string; args?: unknown }
   | { type: 'turn/toolEnd'; id: string; assistantId: string; toolCallId: string; isError: boolean }
+  | { type: 'turn/toolsReconciled'; id: string; assistantId: string; toolCalls: ToolCallSummary[] }
   | { type: 'turn/done'; id: string; assistantId: string; speedTps: number | null; usage: MessageUsage | null }
   | { type: 'turn/error'; id: string; assistantId: string; message: string }
   | { type: 'turn/failed'; id: string; assistantId: string; replyToMessageId: string; content: string }
@@ -260,6 +261,26 @@ export function conversationsReducer(state: ConversationsState, action: Conversa
           steps: (m.steps ?? []).map((s) =>
             s.type === 'tool' && s.id === action.toolCallId ? { ...s, running: false, isError: action.isError } : s
           ),
+        })),
+      });
+    }
+
+    case 'turn/toolsReconciled': {
+      // Materializes a missed tool chip from the DB (docs/FEATURE-slash-tools.md
+      // §4.4): a direct-tool turn is fast enough that tool_start/tool_end can
+      // race ahead of the EventSource attach, leaving a stale "running" chip
+      // with no tool_end to clear it. Deliberately scoped to ONE message via
+      // updateMessage (a no-op if assistantId isn't in `messages` any more)
+      // rather than a full `history/loaded` replace of the whole array - the
+      // fetch this rides is async with no ordering guarantee against what the
+      // user does next, and a full replace risks clobbering a second turn's
+      // optimistic messages if it started before this resolves.
+      const entry = getEntry(state, action.id);
+      return setEntry(state, action.id, {
+        ...entry,
+        messages: updateMessage(entry.messages, action.assistantId, (m) => ({
+          ...m,
+          tool_calls: action.toolCalls,
         })),
       });
     }

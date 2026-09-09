@@ -1,7 +1,10 @@
 import { promises as fs } from "node:fs";
+import { TOOL_MANIFESTS, manifestToJsonSchema } from "@stateless-chat/shared";
 import type { Tool } from "../tool-loop.js";
 import { HOME_ROOT } from "./bash.js";
 import { resolveReadPath, type PathJailRoots } from "./file-path-jail.js";
+
+const READ_FILE_MANIFEST = TOOL_MANIFESTS.find((m) => m.name === "read_file")!;
 
 const MAX_LINES = 200;
 const MAX_CHARS = 4000;
@@ -45,26 +48,10 @@ export function createReadFileTool(options?: ReadFileToolOptions): Tool {
   const roots = options?.roots ?? { root: HOME_ROOT };
 
   return {
-    name: "read_file",
-    description:
-      `Read any text file under /home/ubuntu. Output is truncated to ${MAX_LINES} lines or ${MAX_CHARS} chars, ` +
-      "whichever is hit first. Use offset/limit to page through a large file. Dotfiles, credentials, " +
-      "repository metadata, and files in any project are accessible in full-host mode.",
-    readOnly: true,
-    parameters: {
-      type: "object",
-      properties: {
-        path: {
-          type: "string",
-          description:
-            "File path. Relative paths resolve under /home/ubuntu; absolute paths under /home/ubuntu " +
-            "are accepted. /repo/... is a legacy alias for /home/ubuntu/....",
-        },
-        offset: { type: "number", description: "1-indexed line to start reading from" },
-        limit: { type: "number", description: "Max number of lines to read" },
-      },
-      required: ["path"],
-    },
+    name: READ_FILE_MANIFEST.name,
+    description: READ_FILE_MANIFEST.description,
+    readOnly: READ_FILE_MANIFEST.readOnly,
+    parameters: manifestToJsonSchema(READ_FILE_MANIFEST),
     async execute(args: unknown): Promise<string> {
       const { path: rawPath, offset, limit } = (args ?? {}) as {
         path?: unknown;

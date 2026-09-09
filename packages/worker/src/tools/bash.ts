@@ -1,6 +1,9 @@
 import { spawn } from "node:child_process";
 import path from "node:path";
+import { TOOL_MANIFESTS, manifestToJsonSchema } from "@stateless-chat/shared";
 import type { Tool } from "../tool-loop.js";
+
+const BASH_MANIFEST = TOOL_MANIFESTS.find((m) => m.name === "bash")!;
 
 const OUTPUT_LIMIT = 4000;
 const TRUNCATION_SUFFIX = "\n...[output truncated]";
@@ -107,21 +110,9 @@ export function createBashTool(options?: {
   timeoutMs?: number;
 }): Tool {
   return {
-    name: "bash",
-    description:
-      "Run an unrestricted shell command on the host as ubuntu. This is NOT a sandbox: " +
-      "ubuntu has passwordless sudo/docker access and commands may read or modify the " +
-      "entire machine, not just /home/ubuntu. Default cwd and HOME: /home/ubuntu.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: {
-          type: "string",
-          description: "Shell command to run (bash) on the host",
-        },
-      },
-      required: ["command"],
-    },
+    name: BASH_MANIFEST.name,
+    description: BASH_MANIFEST.description,
+    parameters: manifestToJsonSchema(BASH_MANIFEST),
     async execute(args: unknown): Promise<string> {
       const { command } = (args ?? {}) as { command?: unknown };
       if (typeof command !== "string" || command.trim() === "") {
